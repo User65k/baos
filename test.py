@@ -13,13 +13,10 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 #
 
-import time
 from ctypes import (
     CDLL, CFUNCTYPE,
     create_string_buffer,
-    c_int, c_void_p,
-    c_ushort, c_uint, c_ubyte,
-    byref
+    c_int, c_void_p, c_ubyte
 )
 
 
@@ -35,18 +32,6 @@ KDRIVE_INVALID_DESCRIPTOR = -1
 KDRIVE_ERROR_NONE = 0
 KDRIVE_LOGGER_FATAL = 1
 KDRIVE_LOGGER_INFORMATION = 6
-SERIAL_NUMBER_LENGTH = 6
-
-# The maximum number of individual addresses we expect to read at one time
-MAX_IND_ADDR = 5
-
-# Set to 1 to use connection-oriented
-# Set to 0 for connection-less
-connection_oriented = 0
-
-# The address of the device that we connect
-# to for the device services (Property Value Read etc)
-address = c_ushort(0x1165)
 
 
 def main():
