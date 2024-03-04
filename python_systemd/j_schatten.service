@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep the sun out
+Wants=j_schatten.timer
+
+[Service]
+Type=oneshot
+User=pi
+ExecStart=/home/pi/jschatten.py
+
+[Install]
+WantedBy=multi-user.target

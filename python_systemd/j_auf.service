@@ -1,0 +1,11 @@
+[Unit]
+Description=Open the blinds
+Wants=j_auf.timer
+
+[Service]
+Type=oneshot
+User=pi
+ExecStart=/home/pi/jauf.py
+
+[Install]
+WantedBy=multi-user.target

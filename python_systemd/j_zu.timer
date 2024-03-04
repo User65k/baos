@@ -1,0 +1,10 @@
+[Unit]
+Description=Close blinds
+Requires=j_zu.service
+
+[Timer]
+Unit=j_zu.service
+OnCalendar=*-*-* 14:00:00
+
+[Install]
+WantedBy=timers.target

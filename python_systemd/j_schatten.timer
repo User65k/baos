@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep the sun out
+Requires=j_schatten.service
+
+[Timer]
+Unit=j_schatten.service
+OnCalendar=*-6..9-* 13:00:00
+
+[Install]
+WantedBy=timers.target

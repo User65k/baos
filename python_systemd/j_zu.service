@@ -1,0 +1,11 @@
+[Unit]
+Description=Close the blinds
+Wants=j_zu.timer
+
+[Service]
+Type=oneshot
+User=pi
+ExecStart=/home/pi/jzu.py
+
+[Install]
+WantedBy=multi-user.target

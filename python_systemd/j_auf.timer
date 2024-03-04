@@ -1,0 +1,12 @@
+[Unit]
+Description=Open blinds
+Requires=j_auf.service
+
+[Timer]
+Unit=j_auf.service
+OnCalendar=Mon..Fri *-3..10-* 7:30:00
+OnCalendar=Mon..Fri *-11,12,1,2-* 8:00:00
+OnCalendar=Sat,Sun *-*-* 8:30:00
+
+[Install]
+WantedBy=timers.target
