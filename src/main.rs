@@ -13,7 +13,7 @@ fn main() {
 
 	let serial = CString::new("/dev/ttyAMA0").unwrap();
 	let k = KDrive::new().expect("KDrive");
-	let k = KDriveFT12::open(k,&serial).map_err(|_e|"").expect("open FT12");
+	let k = KDriveFT12::open(k,&serial).expect("open FT12");
 
 	k.register_telegram_callback(on_telegram, None);
 
