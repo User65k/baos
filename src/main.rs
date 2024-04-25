@@ -1,14 +1,19 @@
-use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::convert::TryInto;
 use std::ffi::CString;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
+use std::time::{Duration, Instant};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::thread;
 
 mod kdrive;
 use kdrive::{
     KDrive, KDriveFT12, KDriveTelegram, KDRIVE_CEMI_L_DATA_IND, KDRIVE_MAX_GROUP_VALUE_LEN,
 };
+
+///time, up, single step, ID
+type ChannelMsg = (Instant, bool, bool, u8);
 
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:1337").expect("listen port");
@@ -17,11 +22,18 @@ fn main() {
     let k = KDrive::new().expect("KDrive");
     let k = KDriveFT12::open(k, &serial).expect("open FT12");
 
-    k.register_telegram_callback(on_telegram, None);
+	let (mut sender, receiver) = channel::<ChannelMsg>();
+	
+	// Spawn off an expensive computation
+	let t = thread::spawn(move|| {
+		track_movements(receiver);
+	});
+
+    k.register_telegram_callback(on_telegram, NonNull::new(&mut sender as *mut _));
 
     let mut buf = [0u8; 4];
     for stream in listener.incoming() {
-        if let Err(e) = handle_connection(stream, &mut buf, /*&serial,*/ &k) {
+        if let Err(e) = handle_connection(stream, &mut buf, &k) {
             println!("handle_connection failed {}", e);
         }
     }
@@ -32,12 +44,10 @@ fn handle_connection(
     //serial: &CString
     k: &KDrive,
 ) -> std::io::Result<()> {
-    //	let mut stream = stream?;
     let mut stream = match stream {
         Ok(s) => s,
         Err(e) => panic!("accept: {:?}", e),
     };
-    //stream.read_exact(buf)?;
     let len = stream.read(buf)?;
     let buf = &buf[..len];
     println!("Cmd: {:?}", String::from_utf8_lossy(buf));
@@ -57,8 +67,6 @@ fn handle_connection(
             return Err(std::io::ErrorKind::InvalidData.into());
         }
     };
-    //let k = KDrive::new().expect("KDrive");
-    //let k = KDriveFT12::open(k,serial).map_err(|_e|"").expect("ft12");
     match target {
         b"A" => {
             for addr in to_bus_addr(b'a')..=to_bus_addr(b'h') {
@@ -103,7 +111,7 @@ const fn to_bus_addr(c: u8) -> u16 {
 }
 const BUS_START_ADDR: u8 = 0xaa;
 
-extern "C" fn on_telegram(data: *const u8, len: u32, _user_data: Option<NonNull<c_void>>) {
+extern "C" fn on_telegram(data: *const u8, len: u32, user_data: Option<NonNull<Sender<ChannelMsg>>>) {
     let data = KDriveTelegram::new(data, len);
     let mut msg = [0; KDRIVE_MAX_GROUP_VALUE_LEN];
 
@@ -116,7 +124,9 @@ extern "C" fn on_telegram(data: *const u8, len: u32, _user_data: Option<NonNull<
                         if msg != [0] {
                             println!("Group Write: 1 {:?}", msg);
                             //set all to UP
-                            //todo!();
+                            if let Some(mut sender) = user_data {
+                            	unsafe{sender.as_mut()}.send((Instant::now(),true, false, 0));
+							}
                         }
                         return;
                     }
@@ -126,8 +136,17 @@ extern "C" fn on_telegram(data: *const u8, len: u32, _user_data: Option<NonNull<
                     }
                     addr if addr & 0xFE00 == 0x1000 => {
                         if msg.len() == 1 {
-                            //keep track of own
-                            track_write(addr, msg[0]);
+                            //keep track of own IDs
+							if let Some(mut sender) = user_data {
+                            	track_write(addr, msg[0], unsafe{sender.as_mut()});
+							}
+							//[29, 0, bc, e0, 12, 12, 11, 32, 1, 0, 80]
+							// KDRIVE_CEMI_L_DATA_IND
+							//        xx  xx - ctrl
+							//                xx  xx - src
+							//                        xx  xx - dst
+							//                                len
+							//                                    
                             return;
                         }
                     }
@@ -144,10 +163,13 @@ extern "C" fn on_telegram(data: *const u8, len: u32, _user_data: Option<NonNull<
             // 0x10 | 0x11
             if data[10] & 0x80 != 0 {
                 // 0x80 | 0x81
-                track_write(
-                    u16::from_be_bytes(data[6..8].try_into().unwrap()),
-                    data[10] & 0x70,
-                );
+				if let Some(mut sender) = user_data {
+					track_write(
+						u16::from_be_bytes(data[6..8].try_into().unwrap()),
+						data[10] & 0x70,
+						unsafe{sender.as_mut()}
+					);
+				}
             }
         }
     }
@@ -155,12 +177,15 @@ extern "C" fn on_telegram(data: *const u8, len: u32, _user_data: Option<NonNull<
 }
 
 
-fn track_write(addr: u16, val: u8) {
+fn track_write(addr: u16, val: u8, sender: &mut Sender<ChannelMsg>) {
     let upper = addr & 0xFF00;
     let lower = (addr & 0xff) as u8;
     if let Some(r) = lower.checked_sub(BUS_START_ADDR) {
         if r <= b'h' - b'a' {
-            print!("Itse me: ");
+			if let Err(_) = sender.send((Instant::now(),val==0, upper == 0x11_00, lower)) {
+                println!("send failed")
+            }
+			return;
         }
     }
     if upper == 0x11_00 {
@@ -170,4 +195,89 @@ fn track_write(addr: u16, val: u8) {
     } else {
         println!("Group Write: 0x{:x} {:?}", addr, val);
     }
+}
+
+fn track_movements(receiver: Receiver<ChannelMsg>) {
+	//let mut states = rustc_hash::FxHashMap::with_capacity_and_hasher(8, Default::default());
+    let mut states = std::collections::HashMap::with_capacity(8);
+	loop {
+		//70s complete
+		//2s turn -> 7 steps -> 285 ms
+		match receiver.recv_timeout(Duration::from_secs(10)) {
+			Err(RecvTimeoutError::Disconnected) => return,
+			Ok((time, goes_up, is_single_step, id)) => {
+				if id == 0 {
+					//all up
+					for k in 0..=b'h' - b'a' {
+						let id = k+BUS_START_ADDR;
+						states.insert(id, (Some(time), goes_up, 0, 100));
+					}
+					continue;
+				}//0
+				if is_single_step {
+					if let Some((ref mut otime, ref mut moves_up, ref mut pos, ref mut ang)) = states.get_mut(&id) {
+                        if let Some(t) = otime.take() {
+                            //update
+                            let time_old = time.duration_since(t);//1
+                            shortened_move(id, time_old, *moves_up, pos, ang);//2
+                        }
+						//TODO
+					}
+					continue;
+				}
+				if let Some((ref mut otime, ref mut moves_up, ref mut pos, ref mut ang)) = states.get_mut(&id) {
+					//check privious entry
+					if let Some(t) = otime.take() {
+                        //update
+                        let time_old = time.duration_since(t);//3
+                        shortened_move(id, time_old, *moves_up, pos, ang);//4
+					}
+					*otime = Some(time);
+					*moves_up = goes_up;
+				}else{
+					states.insert(id, (Some(time), goes_up, 0, 100));
+				}
+			},
+			Err(RecvTimeoutError::Timeout) => {
+				//clean up status?
+				for k in 0..=b'h' - b'a' {
+					let id = k+BUS_START_ADDR;
+					if let Some((ref mut time, ref mut moves_up, ref mut pos, ref mut ang)) = states.get_mut(&id) {
+						if let Some(t) = time {
+							if t.elapsed() >= Duration::from_secs(70) {
+								*time = None;
+								full_move(id, *moves_up, pos, ang);
+							}
+						}
+					}
+				}
+			},
+		}
+	} 
+}
+fn shortened_move(id: u8, time_old: Duration, moves_up: bool, pos: &mut i32, ang: &mut i32) {
+    if time_old >= Duration::from_secs(70) {
+        full_move(id, moves_up, pos, ang);
+        return;
+    }
+    println!("{} moved {} for {} ms", id, moves_up, time_old.as_millis());
+    if time_old.as_secs() >= 2 {
+        if moves_up {
+            *ang = 100;
+        }else{
+            *ang = 0;
+        }
+    }
+    //TODO
+}
+fn full_move(id: u8, moves_up: bool, pos: &mut i32, ang: &mut i32) {
+    //complete run
+    if moves_up {
+        *pos = 0;
+        *ang = 100;
+    }else{
+        *pos = 100;
+        *ang = 0;
+    }
+    println!("{} moved {} completely", id, moves_up);
 }

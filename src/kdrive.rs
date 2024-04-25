@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use std::ffi::{CStr, CString};
+use std::{ffi::{CStr, CString}, ops::{BitAnd, Shr}};
 
 type c_char = i8;
 type Ap = i32;
@@ -45,6 +45,7 @@ extern "C" {
     ) -> u32;
 }
 pub type TelegramCallback<T> = extern "C" fn(*const u8, u32, Option<NonNull<T>>);
+///cEMI message code for L_Data.ind
 pub const KDRIVE_CEMI_L_DATA_IND: u8 = 0x29;
 pub const KDRIVE_MAX_GROUP_VALUE_LEN: usize = 14;
 
@@ -66,7 +67,7 @@ impl KDrive {
     pub fn register_telegram_callback<T>(
         &self,
         func: TelegramCallback<T>,
-        user_data: Option<NonNull<*mut T>>,
+        user_data: Option<NonNull<T>>,
     ) -> u32 {
         let mut key = 0;
         unsafe {
@@ -117,6 +118,7 @@ impl core::ops::Deref for KDriveFT12 {
     }
 }
 
+/// Apparently a cEMI Message (common external message interface)
 pub struct KDriveTelegram {
     data: *const u8,
     len: u32,
@@ -178,15 +180,14 @@ pub struct KDriveErr(u32);
 impl std::fmt::Debug for KDriveErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("KDriveErr: ")?;
+        f.write_fmt(format_args!("0x{:X} - ", self.0))?;
         std::fmt::Display::fmt(&self, f)
     }
 }
 impl std::fmt::Display for KDriveErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("0x{:X} - ", self.0))?;
         let mut msg = Vec::with_capacity(1024);
         unsafe { kdrive_get_error_message(self.0, msg.as_mut_ptr(), msg.capacity() as u32) };
-        //msg.set_len(new_len)
         if let Ok(s) = unsafe { CStr::from_ptr(msg.as_ptr()) }.to_str() {
             f.write_str(s)
         } else {
