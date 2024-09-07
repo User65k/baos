@@ -1,10 +1,11 @@
 use core::ptr::NonNull;
 use std::convert::TryInto;
 use std::ffi::CString;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{mpsc::{channel, Receiver, RecvTimeoutError, Sender}, Mutex};
 use std::thread;
 
 mod kdrive;
@@ -14,6 +15,8 @@ use kdrive::{
 
 ///time, up, single step, ID
 type ChannelMsg = (Instant, bool, bool, u8);
+///time of last change, direction, curr_pos, curr_ang
+type StateStore = std::collections::HashMap<u8, (Option<Instant>, bool, Pos, Angle)>;
 
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:1337").expect("listen port");
@@ -23,17 +26,20 @@ fn main() {
     let k = KDriveFT12::open(k, &serial).expect("open FT12");
 
 	let (mut sender, receiver) = channel::<ChannelMsg>();
-	
+
+    let states = Arc::new(Mutex::new(std::collections::HashMap::with_capacity(8)));
+	//let mut states = rustc_hash::FxHashMap::with_capacity_and_hasher(8, Default::default());
+    let state = Arc::clone(&states);	
 	// Spawn off an expensive computation
 	let t = thread::spawn(move|| {
-		track_movements(receiver);
+		track_movements(receiver, states);
 	});
 
     k.register_telegram_callback(on_telegram, NonNull::new(&mut sender as *mut _));
 
     let mut buf = [0u8; 4];
     for stream in listener.incoming() {
-        if let Err(e) = handle_connection(stream, &mut buf, &k) {
+        if let Err(e) = handle_connection(stream, &mut buf, &k, &state) {
             println!("handle_connection failed {}", e);
         }
     }
@@ -41,8 +47,8 @@ fn main() {
 fn handle_connection(
     stream: std::io::Result<TcpStream>,
     buf: &mut [u8],
-    //serial: &CString
     k: &KDrive,
+    state: &Arc<Mutex<StateStore>>
 ) -> std::io::Result<()> {
     let mut stream = match stream {
         Ok(s) => s,
@@ -63,6 +69,17 @@ fn handle_connection(
         Some(b"S") => (0x1100, &[1]),
         Some(b"D") => (0x1100, &[1]), //runter
         Some(b"U") => (0x1100, &[0]), //rauf
+        Some(b"?") => {//query data
+            let s = state.lock().expect("not pos");
+            for addr in to_bus_addr(b'a')..=to_bus_addr(b'h') {
+                if let Some((_, _, i, j)) = s.get(&(addr as u8)) {
+                    stream.write_all(&[(*i).into(), (*j).into()])?;
+                }else{
+                    stream.write_all(&[255, 255])?;
+                }
+            }
+            return Ok(());
+        },
         _ => {
             return Err(std::io::ErrorKind::InvalidData.into());
         }
@@ -110,6 +127,9 @@ const fn to_bus_addr(c: u8) -> u16 {
     (c - b'a' + BUS_START_ADDR) as u16
 }
 const BUS_START_ADDR: u8 = 0xaa;
+//57.57s complete
+//2s turn -> 7 steps -> 285 ms
+const FULL_TRAVEL_TIME: Duration = Duration::from_millis(57_600);
 
 extern "C" fn on_telegram(data: *const u8, len: u32, user_data: Option<NonNull<Sender<ChannelMsg>>>) {
     let data = KDriveTelegram::new(data, len);
@@ -125,7 +145,9 @@ extern "C" fn on_telegram(data: *const u8, len: u32, user_data: Option<NonNull<S
                             println!("Group Write: 1 {:?}", msg);
                             //set all to UP
                             if let Some(mut sender) = user_data {
-                            	unsafe{sender.as_mut()}.send((Instant::now(),true, false, 0));
+                            	if unsafe{sender.as_mut()}.send((Instant::now(),true, false, 0)).is_err() {
+                                    println!("send failed (wind)")
+                                }
 							}
                         }
                         return;
@@ -166,85 +188,116 @@ extern "C" fn on_telegram(data: *const u8, len: u32, user_data: Option<NonNull<S
 				if let Some(mut sender) = user_data {
 					track_write(
 						u16::from_be_bytes(data[6..8].try_into().unwrap()),
-						data[10] & 0x70,
+						data[10] & 0x7F,
 						unsafe{sender.as_mut()}
 					);
 				}
+                return;
             }
         }
     }
     println!("Data: {:?}", data);
 }
 
+//heliocron::calc::SolarCalculations
 
 fn track_write(addr: u16, val: u8, sender: &mut Sender<ChannelMsg>) {
     let upper = addr & 0xFF00;
     let lower = (addr & 0xff) as u8;
     if let Some(r) = lower.checked_sub(BUS_START_ADDR) {
         if r <= b'h' - b'a' {
-			if let Err(_) = sender.send((Instant::now(),val==0, upper == 0x11_00, lower)) {
+            println!("Bus: 0x{:x} {}", addr, val);
+			if sender.send((Instant::now(),val==0, upper == 0x11_00, lower)).is_err() {
                 println!("send failed")
             }
 			return;
         }
     }
     if upper == 0x11_00 {
-        println!("Step: 0x{:x} {:?}", lower, val);
+        //println!("Step: 0x{:x} {:?}", lower, val);
     } else if upper == 0x10_00 {
-        println!("Voll: 0x{:x} {:?}", lower, val);
+        //println!("Voll: 0x{:x} {:?}", lower, val);
     } else {
         println!("Group Write: 0x{:x} {:?}", addr, val);
     }
 }
+/// time: Time of Event
+/// goes_up: direction of move
+/// is_single_step
+/// id: bus address
+/// states: HashMap to store it all
+#[inline]
+fn track_single_press(time: Instant, goes_up: bool, is_single_step: bool, id: u8, states: &mut StateStore)
+{
+    if id == 0 {
+        //wind - all up
+        for k in 0..=b'h' - b'a' {
+            let id = k+BUS_START_ADDR;
+            states.insert(id, (Some(time), goes_up, Pos::top(), Angle::top()));
+        }
+        return;
+    }
+    if is_single_step {
+        if let Some((ref mut otime, ref mut moves_up, ref mut pos, ref mut ang)) = states.get_mut(&id) {
+            if let Some(t) = otime.take() {
+                //it was on the move... -> stop it
+                let time_moving = time.duration_since(t);
+                shortened_move(id, time_moving, *moves_up, pos, ang);
+            }else{
+                //just move a single step (1/7) 14pts
+                if goes_up {
+                    ang.up(14);
+                }else{
+                    ang.down(14);
+                }
+                //TODO move a little, if in saturation
+            }
+        }
+        //else
+        // just move a single step
+        // - but we dont know anything about its pos
+        // -> so ignore it
+        return;
+    }
+    if let Some((ref mut otime, ref mut moves_up, ref mut pos, ref mut ang)) = states.get_mut(&id) {
+        //check privious entry
+        if let Some(t) = otime.take() {
+            //update
+            let time_moving = time.duration_since(t);
+            shortened_move(id, time_moving, *moves_up, pos, ang);
+        }
+        //remember this move
+        *otime = Some(time);
+        *moves_up = goes_up;
+    }else{
+        //remember this move
+        let mut ang = Angle::bottom();
+        let mut pos = Pos::bottom();
+        //start at the opposite full range
+        full_move(id, !goes_up, &mut pos, &mut ang);
+        states.insert(id, (Some(time), goes_up, pos, ang));
+    }
+}
 
-fn track_movements(receiver: Receiver<ChannelMsg>) {
-	//let mut states = rustc_hash::FxHashMap::with_capacity_and_hasher(8, Default::default());
-    let mut states = std::collections::HashMap::with_capacity(8);
+fn track_movements(receiver: Receiver<ChannelMsg>, states: Arc<Mutex<StateStore>>) {
 	loop {
-		//70s complete
-		//2s turn -> 7 steps -> 285 ms
 		match receiver.recv_timeout(Duration::from_secs(10)) {
 			Err(RecvTimeoutError::Disconnected) => return,
 			Ok((time, goes_up, is_single_step, id)) => {
-				if id == 0 {
-					//all up
-					for k in 0..=b'h' - b'a' {
-						let id = k+BUS_START_ADDR;
-						states.insert(id, (Some(time), goes_up, 0, 100));
-					}
-					continue;
-				}//0
-				if is_single_step {
-					if let Some((ref mut otime, ref mut moves_up, ref mut pos, ref mut ang)) = states.get_mut(&id) {
-                        if let Some(t) = otime.take() {
-                            //update
-                            let time_old = time.duration_since(t);//1
-                            shortened_move(id, time_old, *moves_up, pos, ang);//2
-                        }
-						//TODO
-					}
-					continue;
-				}
-				if let Some((ref mut otime, ref mut moves_up, ref mut pos, ref mut ang)) = states.get_mut(&id) {
-					//check privious entry
-					if let Some(t) = otime.take() {
-                        //update
-                        let time_old = time.duration_since(t);//3
-                        shortened_move(id, time_old, *moves_up, pos, ang);//4
-					}
-					*otime = Some(time);
-					*moves_up = goes_up;
-				}else{
-					states.insert(id, (Some(time), goes_up, 0, 100));
-				}
+                track_single_press(time, goes_up, is_single_step, id, &mut states.lock().expect("poised"));
+                println!("states:");
+                let s = states.lock().expect("poised");
+                for (&k,(_i, _u, p, a)) in s.iter() {
+                    println!("{:x}: {:?} {:?}", k, p, a);
+                }
 			},
 			Err(RecvTimeoutError::Timeout) => {
-				//clean up status?
+				//clean up status -> look for full moves
 				for k in 0..=b'h' - b'a' {
 					let id = k+BUS_START_ADDR;
-					if let Some((ref mut time, ref mut moves_up, ref mut pos, ref mut ang)) = states.get_mut(&id) {
+					if let Some((ref mut time, ref mut moves_up, ref mut pos, ref mut ang)) = states.lock().expect("poised").get_mut(&id) {
 						if let Some(t) = time {
-							if t.elapsed() >= Duration::from_secs(70) {
+							if t.elapsed() >= FULL_TRAVEL_TIME {
 								*time = None;
 								full_move(id, *moves_up, pos, ang);
 							}
@@ -255,29 +308,109 @@ fn track_movements(receiver: Receiver<ChannelMsg>) {
 		}
 	} 
 }
-fn shortened_move(id: u8, time_old: Duration, moves_up: bool, pos: &mut i32, ang: &mut i32) {
-    if time_old >= Duration::from_secs(70) {
+fn shortened_move(id: u8, time_moving: Duration, moves_up: bool, pos: &mut Pos, ang: &mut Angle) {
+    if time_moving >= FULL_TRAVEL_TIME {
         full_move(id, moves_up, pos, ang);
         return;
     }
-    println!("{} moved {} for {} ms", id, moves_up, time_old.as_millis());
-    if time_old.as_secs() >= 2 {
+    println!("{:x} moved {} for {} ms", id, moves_up, time_moving.as_millis());
+    if time_moving.as_secs() >= 2 {
         if moves_up {
-            *ang = 100;
+            *ang = Angle::top();
         }else{
-            *ang = 0;
+            *ang = Angle::bottom();
         }
     }
-    //TODO
+    if moves_up {
+        pos.up(time_moving);
+    }else{
+        pos.down(time_moving);
+    }
 }
-fn full_move(id: u8, moves_up: bool, pos: &mut i32, ang: &mut i32) {
+fn full_move(id: u8, moves_up: bool, pos: &mut Pos, ang: &mut Angle) {
     //complete run
     if moves_up {
-        *pos = 0;
-        *ang = 100;
+        *pos = Pos::top();
+        *ang = Angle::top();
     }else{
-        *pos = 100;
-        *ang = 0;
+        *pos = Pos::bottom();
+        *ang = Angle::bottom();
     }
-    println!("{} moved {} completely", id, moves_up);
+    println!("{:x} moved {} completely", id, moves_up);
+}
+#[derive(Debug, Clone, Copy)]
+struct Angle(u8);
+impl Angle {
+    fn up(&mut self, arg: u8) -> bool {
+        let t = self.0 + arg;
+        if t > 100 {
+            self.0 = 100;
+            true
+        }else{
+            self.0 = t;
+            false
+        }
+    }
+    
+    fn down(&mut self, arg: u8) -> bool {
+        if let Some(n) = self.0.checked_sub(arg) {
+            self.0 = n;
+            false
+        }else{
+            self.0 = 0;
+            true
+        }
+    }
+    fn top() ->  Angle {
+        Angle(100)
+    }
+    fn bottom() ->  Angle {
+        Angle(0)
+    }
+}
+impl From<Angle> for u8 {
+    fn from(val: Angle) -> Self {
+        val.0
+    }
+}
+#[derive(Debug, Clone, Copy)]
+struct Pos(u8);
+impl Pos {
+    fn top() ->  Pos {
+        Pos(100)
+    }
+    fn bottom() ->  Pos {
+        Pos(0)
+    }
+    fn up(&mut self, time_moving: Duration) {
+        if time_moving >= FULL_TRAVEL_TIME {
+            self.0 = 100;
+            return;
+        }
+        let div = 100 * time_moving.as_nanos() / FULL_TRAVEL_TIME.as_nanos();
+        let t = self.0 + div as u8;
+        if t > 100 {
+            self.0 = 100;
+        }else{
+            self.0 = t;
+        }
+    }
+    
+    fn down(&mut self, time_moving: Duration) {
+        if time_moving >= FULL_TRAVEL_TIME {
+            self.0 = 0;
+            return;
+        }
+        let div = 100 * time_moving.as_nanos() / FULL_TRAVEL_TIME.as_nanos();
+        if let Some(n) = self.0.checked_sub(div as u8) {
+            self.0 = n;
+        }else{
+            self.0 = 0;
+        }
+    }
+}
+impl From<Pos> for u8 {
+    fn from(val: Pos) -> Self {
+        val.0
+    }
 }

@@ -49,6 +49,7 @@ pub type TelegramCallback<T> = extern "C" fn(*const u8, u32, Option<NonNull<T>>)
 pub const KDRIVE_CEMI_L_DATA_IND: u8 = 0x29;
 pub const KDRIVE_MAX_GROUP_VALUE_LEN: usize = 14;
 
+#[derive(Clone)]
 pub struct KDrive(Ap);
 impl KDrive {
     pub fn new() -> Result<KDrive, ()> {
@@ -73,7 +74,7 @@ impl KDrive {
         unsafe {
             kdrive_ap_register_telegram_callback(
                 self.0,
-                core::mem::transmute(func),
+                core::mem::transmute::<TelegramCallback<T>, TelegramCallback<c_void>>(func),
                 user_data.map(|nn| nn.cast()),
                 &mut key,
             );
@@ -93,10 +94,11 @@ impl Drop for KDrive {
         }
     }
 }
+#[derive(Clone)]
 pub struct KDriveFT12(KDrive);
 impl KDriveFT12 {
     pub fn open(ap: KDrive, dev: &CString) -> Result<KDriveFT12, KDriveErr> {
-        let op = unsafe { kdrive_ap_open_serial_ft12(ap.0, dev.as_ptr()) };
+        let op = unsafe { kdrive_ap_open_serial_ft12(ap.0, dev.as_ptr().cast()) };
         if op != 0 {
             Err(KDriveErr(op))
         } else {
@@ -188,7 +190,7 @@ impl std::fmt::Display for KDriveErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut msg = Vec::with_capacity(1024);
         unsafe { kdrive_get_error_message(self.0, msg.as_mut_ptr(), msg.capacity() as u32) };
-        if let Ok(s) = unsafe { CStr::from_ptr(msg.as_ptr()) }.to_str() {
+        if let Ok(s) = unsafe { CStr::from_ptr(msg.as_ptr().cast()) }.to_str() {
             f.write_str(s)
         } else {
             Err(std::fmt::Error)
