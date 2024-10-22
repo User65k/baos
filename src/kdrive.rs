@@ -1,6 +1,9 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use std::{ffi::{CStr, CString}, ops::{BitAnd, Shr}};
+use std::{
+    ffi::{CStr, CString},
+    ops::{BitAnd, Shr},
+};
 
 type c_char = i8;
 type Ap = i32;
@@ -32,7 +35,7 @@ extern "C" {
         func: TelegramCallback<c_void>,
         user_data: Option<NonNull<c_void>>,
         key: &mut u32,
-    );
+    ) -> u32;
     fn kdrive_ap_receive(fd: Ap, telegram: *mut u8, telegram_len: u32, timeout_ms: u32) -> u32;
     fn kdrive_ap_get_message_code(data: *const u8, len: u32, code: &mut u8);
     fn kdrive_ap_is_group_write(telegram: *const u8, telegram_len: u32) -> u32;
@@ -49,7 +52,6 @@ pub type TelegramCallback<T> = extern "C" fn(*const u8, u32, Option<NonNull<T>>)
 pub const KDRIVE_CEMI_L_DATA_IND: u8 = 0x29;
 pub const KDRIVE_MAX_GROUP_VALUE_LEN: usize = 14;
 
-#[derive(Clone)]
 pub struct KDrive(Ap);
 impl KDrive {
     pub fn new() -> Result<KDrive, ()> {
@@ -60,26 +62,33 @@ impl KDrive {
             Ok(KDrive(ap))
         }
     }
-    pub fn group_write(&self, addr: u16, data: &[u8]) {
-        unsafe {
-            kdrive_ap_group_write(self.0, addr, data.as_ptr(), data.len() as u32);
+    pub fn group_write(&self, addr: u16, data: &[u8]) -> Result<(), KDriveErr> {
+        let e = unsafe { kdrive_ap_group_write(self.0, addr, data.as_ptr(), data.len() as u32) };
+        if e == 0 {
+            Ok(())
+        } else {
+            Err(KDriveErr(e))
         }
     }
     pub fn register_telegram_callback<T>(
         &self,
         func: TelegramCallback<T>,
         user_data: Option<NonNull<T>>,
-    ) -> u32 {
+    ) -> Result<u32, KDriveErr> {
         let mut key = 0;
-        unsafe {
+        let e = unsafe {
             kdrive_ap_register_telegram_callback(
                 self.0,
                 core::mem::transmute::<TelegramCallback<T>, TelegramCallback<c_void>>(func),
                 user_data.map(|nn| nn.cast()),
                 &mut key,
-            );
+            )
+        };
+        if e == 0 {
+            Ok(key)
+        } else {
+            Err(KDriveErr(e))
         }
-        key
     }
     pub fn recv<'a>(&self, data: &'a mut [u8], timeout_ms: u32) -> &'a [u8] {
         let l =
@@ -94,7 +103,7 @@ impl Drop for KDrive {
         }
     }
 }
-#[derive(Clone)]
+
 pub struct KDriveFT12(KDrive);
 impl KDriveFT12 {
     pub fn open(ap: KDrive, dev: &CString) -> Result<KDriveFT12, KDriveErr> {
@@ -198,3 +207,8 @@ impl std::fmt::Display for KDriveErr {
     }
 }
 impl std::error::Error for KDriveErr {}
+impl From<KDriveErr> for std::io::Error {
+    fn from(error: KDriveErr) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Other, error)
+    }
+}
