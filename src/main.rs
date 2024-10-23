@@ -18,10 +18,10 @@ use kdrive::{
 mod types;
 use types::{Blind, Direction, Pos, Angle, ChannelMsg, StateStore, GroupWriter};
 
-///57.57s complete
-///2s turn -> 7 steps -> 285 ms
-const FULL_TRAVEL_TIME: Duration = Duration::from_millis(63_000);//57_600
-const FULL_TURN_TIME: Duration = Duration::from_millis(2_000);
+/// time a blind needs to go from top to bottom or visa verce
+const FULL_TRAVEL_TIME: Duration = Duration::from_millis(63_500);//57_600
+/// time a blind needs to turn upside down
+const FULL_TURN_TIME: Duration = Duration::from_millis(2_800);
 
 
 fn main() {
@@ -63,8 +63,10 @@ fn move_to_pos(
     state: &Arc<Mutex<StateStore>>,
 ) -> std::io::Result<()> {
     //get curr pos
-    let (mut p, mut a) = match state.lock().unwrap().get(&id) {
-        Some((_, _, p, a)) => (*p, *a),
+    let a = state.lock().unwrap().get(&id).map(|(_, _, p, a)|(*p, *a));
+    //match on a in oder to avoid blocking the mutex in None case
+    let (mut p, mut a) = match a {
+        Some(a) => a,
         None => {
             //we don't know where it is, so drive it into the closest side
             let dir = if target_p < 50 {

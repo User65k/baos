@@ -70,6 +70,7 @@ impl Angle {
         }
         let div = Self::MAX as u128 * time_moving.as_nanos() / crate::FULL_TURN_TIME.as_nanos();
         let t = self.0 + div as u8;
+        //t = t.clamp(0, Self::MAX);
         if t > Self::MAX {
             self.0 = Self::MAX;
         } else {
@@ -83,11 +84,7 @@ impl Angle {
             return;
         }
         let div = Self::MAX as u128 * time_moving.as_nanos() / crate::FULL_TURN_TIME.as_nanos();
-        if let Some(n) = self.0.checked_sub(div as u8) {
-            self.0 = n;
-        } else {
-            self.0 = 0;
-        }
+        self.0 = self.0.saturating_sub(div as u8);
     }
     pub fn step_up(&mut self, arg: u8) -> bool {
         let t = self.0 + arg;
@@ -150,11 +147,7 @@ impl Pos {
             return;
         }
         let div = 100 * time_moving.as_nanos() / crate::FULL_TRAVEL_TIME.as_nanos();
-        if let Some(n) = self.0.checked_sub(div as u8) {
-            self.0 = n;
-        } else {
-            self.0 = 0;
-        }
+        self.0 = self.0.saturating_sub(div as u8);
     }
 }
 impl From<Pos> for u8 {
