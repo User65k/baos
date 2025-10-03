@@ -1,6 +1,6 @@
 [Unit]
 Description=Open blinds
-Requires=j_auf.service
+#Requires=j_auf.service
 
 [Timer]
 Unit=j_auf.service

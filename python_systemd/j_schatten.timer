@@ -1,6 +1,6 @@
 [Unit]
 Description=Keep the sun out
-Requires=j_schatten.service
+#Requires=j_schatten.service
 
 [Timer]
 Unit=j_schatten.service

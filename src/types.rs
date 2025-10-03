@@ -1,6 +1,6 @@
 use std::fmt::Debug;
-use tokio::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::Sender;
 
 ///time, up, single step, ID
 pub type ChannelMsg = (Instant, Direction, bool, Blind);
@@ -12,7 +12,7 @@ pub type GroupWriter = Sender<(u16, Direction)>;
 #[repr(u8)]
 pub enum Direction {
     Up = 0,
-    Down = 1
+    Down = 1,
 }
 /// buss address of a blind
 #[repr(transparent)]
@@ -45,7 +45,7 @@ impl Blind {
     pub fn to_bus_addr(self, single_step: bool) -> u16 {
         if single_step {
             Self::CMD_SINGLE_STEP + self.0 as u16
-        }else{
+        } else {
             Self::CMD_FULL_MOVE + self.0 as u16
         }
     }

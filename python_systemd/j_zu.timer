@@ -1,6 +1,6 @@
 [Unit]
 Description=Close blinds
-Requires=j_zu.service
+#Requires=j_zu.service
 
 [Timer]
 Unit=j_zu.service
