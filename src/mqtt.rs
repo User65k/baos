@@ -1,61 +1,88 @@
 use crate::types::{Blind, Direction, GroupWriter, StateStore};
-use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS, SubscribeFilter};
+use rumqttc::v5::{
+    mqttbytes::{
+        v5::{Filter, LastWill, Packet},
+        QoS,
+    },
+    AsyncClient, Event, EventLoop, MqttOptions,
+};
 use std::{env, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 pub async fn setup() -> (AsyncClient, EventLoop) {
-    let mut mqttoptions = MqttOptions::new("rumqtt-sync", "192.168.178.25", 1883);
+    let mut mqttoptions = MqttOptions::new("blinds", "192.168.178.25", 1883);
     mqttoptions.set_credentials(
         env::var("HA_MQTT_USER").expect("no mqtt user"),
         env::var("HA_MQTT_PASS").expect("no mqtt password"),
     );
+    mqttoptions.set_last_will(LastWill {
+        topic: "cover/availability".into(),
+        message: "offline".into(),
+        qos: QoS::AtLeastOnce,
+        retain: true,
+        properties: None,
+    });
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
     let (client, connection) = AsyncClient::new(mqttoptions, 32);
-    client
-        .subscribe_many((b'a'..=b'h').flat_map(|c| {
-            [
-                SubscribeFilter::new(format!("cover/{}/set", c as char), QoS::AtMostOnce),
-                SubscribeFilter::new(format!("cover/{}/tilt", c as char), QoS::AtMostOnce),
-            ]
-        }))
-        .await
-        .expect("sub");
-
-    client
-        .publish("cover/availability", QoS::AtLeastOnce, true, "online")
-        .await
-        .expect("avail");
     (client, connection)
 }
 pub async fn drive(
     mut connection: EventLoop,
     bus_sender: GroupWriter,
     state: Arc<Mutex<StateStore>>,
+    client: AsyncClient,
 ) {
     loop {
         match connection.poll().await {
             Ok(notification) => {
                 //println!("Notification = {:?}", notification);
-                if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish)) = notification {
-                    if let Some(s) = publish.topic.strip_prefix("cover/") {
-                        if let Some(id) = s.strip_suffix("/set") {
-                            println!("move {} to {:?}", id, publish.payload); //payload is STOP CLOSE ...
-                            if let Some(b) = blind_from_str(id) {
-                                mqtt_set(b, &publish.payload, &bus_sender).await
+                match notification {
+                    Event::Incoming(Packet::Publish(publish)) => {
+                        if let Some(s) = publish.topic.strip_prefix(b"cover/") {
+                            if let Some(id) = s.strip_suffix(b"/set") {
+                                println!("move {} to {:?}", id.escape_ascii(), publish.payload); //payload is STOP CLOSE ...
+                                if let Some(b) = blind_from_str(id) {
+                                    mqtt_set(b, &publish.payload, &bus_sender).await
+                                }
                             }
-                        }
-                        if let Some(id) = s.strip_suffix("/tilt") {
-                            println!("tilt {} to {:?}", id, publish.payload); //payload is 0-7 STOP
-                            if let Some(b) = blind_from_str(id) {
-                                mqtt_tilt(b, &publish.payload, &bus_sender, &state).await
+                            if let Some(id) = s.strip_suffix(b"/tilt") {
+                                println!("tilt {} to {:?}", id.escape_ascii(), publish.payload); //payload is 0-7 STOP
+                                if let Some(b) = blind_from_str(id) {
+                                    mqtt_tilt(b, &publish.payload, &bus_sender, &state).await
+                                }
                             }
                         }
                     }
+                    Event::Incoming(Packet::ConnAck(_)) => {
+                        println!("MQTT connected");
+                        client
+                            .subscribe_many((b'a'..=b'h').flat_map(|c| {
+                                [
+                                    Filter::new(
+                                        format!("cover/{}/set", c as char),
+                                        QoS::AtMostOnce,
+                                    ),
+                                    Filter::new(
+                                        format!("cover/{}/tilt", c as char),
+                                        QoS::AtMostOnce,
+                                    ),
+                                ]
+                            }))
+                            .await
+                            .expect("sub");
+                        client
+                            .publish("cover/availability", QoS::AtLeastOnce, true, "online")
+                            .await
+                            .expect("avail");
+                    }
+                    _ => {}
                 }
             }
             Err(e) => {
-                connection.clean();
+                //already done on poll: connection.clean();
+
+                //MQTT Error: Mqtt state: Connection closed by peer abruptly
                 eprintln!("MQTT Error: {}", e);
             }
         }
@@ -122,8 +149,8 @@ pub async fn report(id: Blind, state: &Mutex<StateStore>, client: &AsyncClient) 
     }
 }
 
-fn blind_from_str(id: &str) -> Option<Blind> {
-    let id = *id.as_bytes().first()?;
+fn blind_from_str(id: &[u8]) -> Option<Blind> {
+    let id = *id.first()?;
     if id > b'h' {
         return None;
     }
@@ -165,5 +192,5 @@ async fn mqtt_tilt(b: Blind, cmd: &[u8], sender: &GroupWriter, state: &Arc<Mutex
 
     super::move_to_pos(b, p.into(), a, sender, state)
         .await
-        .expect("nope")
+        .expect("cant send")
 }

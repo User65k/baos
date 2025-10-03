@@ -64,9 +64,9 @@ pub const KDRIVE_MAX_GROUP_VALUE_LEN: usize = 14;
 
 // FT1.2 Frame structure
 #[derive(Debug, Clone)]
-pub struct Ft12Frame {
-    pub control: u8,   // Control field
-    pub data: Vec<u8>, // Data payload
+struct Ft12Frame {
+    control: u8,   // Control field
+    data: Vec<u8>, // Data payload
 }
 
 impl Ft12Frame {
@@ -192,6 +192,7 @@ impl TTYPort {
         }
     }
 }
+/// read and write `Ft12Frame`s to and from a `TTYPort`
 struct FT12Dev {
     ///the bus is in use (waiting for more data to read)
     s: tokio::sync::Semaphore,
@@ -407,6 +408,7 @@ impl FT12Dev {
     }
 }
 
+/// KNX BAOS Module 838 kBerry
 pub struct KDriveFT12(FT12Dev);
 
 impl KDriveFT12 {

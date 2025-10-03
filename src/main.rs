@@ -83,9 +83,14 @@ async fn async_main() {
                 set.spawn_local(tracking::track_movements(
                     bus_receiver,
                     states.clone(),
+                    client.clone(),
+                ));
+                set.spawn_local(mqtt::drive(
+                    connection,
+                    bus_sender.clone(),
+                    states.clone(),
                     client,
                 ));
-                set.spawn_local(mqtt::drive(connection, bus_sender.clone(), states.clone()));
             }
             //wait for the first task to "finish" aka crash
             let res = set.join_next().await.unwrap();
@@ -104,7 +109,22 @@ async fn move_to_pos(
     target_a: u8,
     k: &GroupWriter,
     state: &Arc<Mutex<StateStore>>,
-) -> std::io::Result<()> {
+) -> Option<()> {
+    //short circuit
+    match (target_p, target_a) {
+        (0, 0) => {
+            k.send((id.to_bus_addr(false), Direction::Down))
+                .await
+                .ok()?;
+            return Some(());
+        }
+        (100, 7) => {
+            k.send((id.to_bus_addr(false), Direction::Up)).await.ok()?;
+            return Some(());
+        }
+        _ => {}
+    }
+
     //get curr pos
     let a = state.lock().await.get(&id).map(|(_, _, p, a)| (*p, *a));
     //match on a in oder to avoid blocking the mutex in None case
@@ -117,9 +137,7 @@ async fn move_to_pos(
             } else {
                 Direction::Up
             };
-            k.send((id.to_bus_addr(false), dir))
-                .await
-                .expect("send err");
+            k.send((id.to_bus_addr(false), dir)).await.ok()?;
             sleep(FULL_TRAVEL_TIME).await;
             if target_p < 50 {
                 (Pos::bottom(), Angle::bottom())
@@ -140,9 +158,7 @@ async fn move_to_pos(
     if div > 0 {
         //let ttm = FULL_TRAVEL_TIME.mul_f32((div as f32)/100f32);
         let ttm = FULL_TRAVEL_TIME * (div as u32) / 100u32;
-        k.send((id.to_bus_addr(false), dir))
-            .await
-            .expect("send err");
+        k.send((id.to_bus_addr(false), dir)).await.ok()?;
         sleep(ttm).await;
         tracking::shortened_move(id, ttm, dir, &mut p, &mut a);
     }
@@ -153,17 +169,15 @@ async fn move_to_pos(
     } else {
         if cur == target_a {
             // just stop to move
-            k.send((id.to_bus_addr(true), dir)).await.expect("send err");
-            return Ok(());
+            k.send((id.to_bus_addr(true), dir)).await.ok()?;
+            return Some(());
         }
         //go up
         (Direction::Up, target_a - cur)
     };
-    k.send((id.to_bus_addr(false), dir))
-        .await
-        .expect("send err");
+    k.send((id.to_bus_addr(false), dir)).await.ok()?;
     let ttm = FULL_TURN_TIME * (div as u32) / 8u32;
     sleep(ttm).await;
-    k.send((id.to_bus_addr(true), dir)).await.expect("send err");
-    Ok(())
+    k.send((id.to_bus_addr(true), dir)).await.ok()?;
+    Some(())
 }

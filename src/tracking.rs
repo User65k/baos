@@ -41,7 +41,10 @@ pub async fn on_telegram(data: cEMIMsg<'_>, user_data: &Sender<ChannelMsg>) {
                             }
                             2 => {
                                 //wind - no longer avail
-                                println!("Wind: {}", u16::from_be_bytes(msg[..2].try_into().unwrap()));
+                                println!(
+                                    "Wind: {}",
+                                    u16::from_be_bytes(msg[..2].try_into().unwrap())
+                                );
                             }
                             addr if addr & 0xFE00 == 0x1000 => {
                                 if msg.len() == 1 {
@@ -61,16 +64,11 @@ pub async fn on_telegram(data: cEMIMsg<'_>, user_data: &Sender<ChannelMsg>) {
                         }
                         println!("Group Write: 0x{:x} {:?}", addr, msg);
                         return;
-                    },
+                    }
                     MessageCode::LDataCon => {
                         // initiated by our group_write
                         if addr & 0xFE00 == 0x1000 && msg.len() == 1 {
-                            track_write(
-                                addr,
-                                msg[0],
-                                user_data,
-                            )
-                            .await;
+                            track_write(addr, msg[0], user_data).await;
                             return;
                         }
                     }
@@ -115,7 +113,7 @@ async fn track_write(addr: u16, val: u8, sender: &Sender<ChannelMsg>) {
 pub async fn track_movements(
     mut receiver: Receiver<ChannelMsg>,
     states: Arc<Mutex<StateStore>>,
-    #[cfg(feature = "mqtt")] client: rumqttc::AsyncClient,
+    #[cfg(feature = "mqtt")] client: rumqttc::v5::AsyncClient,
 ) {
     loop {
         match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {

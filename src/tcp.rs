@@ -41,8 +41,7 @@ async fn handle_connection(
         Some(b"?") => {
             //query data
             let s = state.lock().await;
-            for c in b'a'..=b'h' {
-                let addr = Blind::from_port(c);
+            for addr in TargetIter::new(target)? {
                 if let Some((t, up, i, j)) = s.get(&addr) {
                     let mut stat = (*j).into(); //0 - 7 -> 0b111
                     if t.is_some() {
@@ -64,7 +63,9 @@ async fn handle_connection(
                 let bus = bus.clone();
                 let state = state.clone();
                 tokio::task::spawn_local(async move {
-                    super::move_to_pos(addr, pos & 0x7f, ang, &bus, &state).await
+                    super::move_to_pos(addr, pos & 0x7f, ang, &bus, &state)
+                        .await
+                        .expect("cant send")
                 });
             }
             return Ok(());
