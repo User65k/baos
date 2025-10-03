@@ -1,5 +1,5 @@
 use crate::types::{Blind, Direction, GroupWriter, StateStore};
-use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS};
+use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS, SubscribeFilter};
 use std::{env, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
@@ -11,17 +11,16 @@ pub async fn setup() -> (AsyncClient, EventLoop) {
     );
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
-    let (client, mut connection) = AsyncClient::new(mqttoptions, 32);
-    for c in b'a'..=b'h' {
-        client
-            .subscribe(format!("cover/{}/set", c as char), QoS::AtMostOnce)
-            .await
-            .expect("sub set");
-        client
-            .subscribe(format!("cover/{}/tilt", c as char), QoS::AtMostOnce)
-            .await
-            .expect("sub tilt");
-    }
+    let (client, connection) = AsyncClient::new(mqttoptions, 32);
+    client.subscribe_many(
+        (b'a'..=b'h').flat_map(|c| {
+            [
+            SubscribeFilter::new(format!("cover/{}/set", c as char), QoS::AtMostOnce),
+            SubscribeFilter::new(format!("cover/{}/tilt", c as char), QoS::AtMostOnce)
+            ]
+        })
+    ).await.expect("sub");
+
     client
         .publish("cover/availability", QoS::AtLeastOnce, true, "online")
         .await
