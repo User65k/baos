@@ -11,9 +11,14 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature="kdrive")]
 mod kdrive;
+#[cfg(not(feature="kdrive"))]
+#[path = "ft12.rs"]
+mod kdrive;
+
 use kdrive::{
-    KDrive, KDriveFT12, KDriveTelegram, KDRIVE_CEMI_L_DATA_IND, KDRIVE_MAX_GROUP_VALUE_LEN,
+    KDrive, KDriveFT12, cEMIMsg, KDRIVE_CEMI_L_DATA_IND, KDRIVE_MAX_GROUP_VALUE_LEN,
 };
 mod types;
 use types::{Blind, Direction, Pos, Angle, ChannelMsg, StateStore, GroupWriter};
@@ -29,7 +34,7 @@ fn main() {
 
     let serial = CString::new("/dev/ttyAMA0").unwrap();
     let k = KDrive::new().expect("KDrive");
-    let k = KDriveFT12::open(k, &serial).expect("open FT12");
+    let mut k = KDriveFT12::open(k, &serial).expect("open FT12");
 
     let (mut sender, receiver) = channel::<ChannelMsg>();
 
@@ -217,12 +222,12 @@ fn get_addr(c: &[u8]) -> std::io::Result<Blind> {
         }
     })
 }
-extern "C" fn on_telegram(
+fn on_telegram(
     data: *const u8,
     len: u32,
     user_data: Option<NonNull<Sender<ChannelMsg>>>,
 ) {
-    let data = KDriveTelegram::new(data, len);
+    let data = cEMIMsg::new(data, len);
     let mut msg = [0; KDRIVE_MAX_GROUP_VALUE_LEN];
 
     if KDRIVE_CEMI_L_DATA_IND == data.get_msg_code() && data.is_group_write() {
@@ -289,7 +294,7 @@ extern "C" fn on_telegram(
             }
         }
     }
-    println!("Data: {:?}", data);
+    //println!("Data: {:?}", data);
 }
 
 //heliocron::calc::SolarCalculations

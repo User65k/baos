@@ -62,7 +62,7 @@ impl KDrive {
             Ok(KDrive(ap))
         }
     }
-    pub fn group_write(&self, addr: u16, data: &[u8]) -> Result<(), KDriveErr> {
+    pub fn group_write(&mut self, addr: u16, data: &[u8]) -> Result<(), KDriveErr> {
         let e = unsafe { kdrive_ap_group_write(self.0, addr, data.as_ptr(), data.len() as u32) };
         if e == 0 {
             Ok(())
@@ -71,7 +71,7 @@ impl KDrive {
         }
     }
     pub fn register_telegram_callback<T>(
-        &self,
+        &mut self,
         func: TelegramCallback<T>,
         user_data: Option<NonNull<T>>,
     ) -> Result<u32, KDriveErr> {
@@ -129,14 +129,14 @@ impl core::ops::Deref for KDriveFT12 {
     }
 }
 
-/// Apparently a cEMI Message (common external message interface)
-pub struct KDriveTelegram {
+/// KDriveTelegram - Apparently a cEMI Message (common external message interface)
+pub struct cEMIMsg {
     data: *const u8,
     len: u32,
 }
-impl KDriveTelegram {
-    pub fn new(data: *const u8, len: u32) -> KDriveTelegram {
-        KDriveTelegram { data, len }
+impl cEMIMsg {
+    pub fn new(data: *const u8, len: u32) -> cEMIMsg {
+        cEMIMsg { data, len }
     }
     pub fn get_msg_code(&self) -> u8 {
         let mut code = 0;
@@ -172,13 +172,13 @@ impl KDriveTelegram {
         }
     }
 }
-impl std::fmt::Debug for KDriveTelegram {
+impl std::fmt::Debug for cEMIMsg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let slice: &[u8] = self;
         f.write_fmt(format_args!("{:x?}", slice))
     }
 }
-impl std::ops::Deref for KDriveTelegram {
+impl std::ops::Deref for cEMIMsg {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
