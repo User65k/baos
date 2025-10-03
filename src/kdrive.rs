@@ -129,6 +129,12 @@ impl core::ops::Deref for KDriveFT12 {
     }
 }
 
+impl core::ops::DerefMut for KDriveFT12 {
+    fn deref_mut(&mut self) -> &mut KDrive {
+        &mut self.0
+    }
+}
+
 /// KDriveTelegram - Apparently a cEMI Message (common external message interface)
 pub struct cEMIMsg {
     data: *const u8,

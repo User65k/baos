@@ -1,0 +1,13 @@
+[target.arm-unknown-linux-gnueabihf]
+dockerfile = "./Dockerfile"
+#pre-build = [
+#    "dpkg --add-architecture armhf",
+#    "apt update && DEBIAN_FRONTEND=noninteractive apt install -y libssl-dev:armhf build-essential pkg-config libssl-dev && apt clean"
+#    ]
+[target.arm-unknown-linux-gnueabi]
+dockerfile = "./Dockerfile2"
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update",
+    "apt-get clean"
+]

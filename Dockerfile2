@@ -1,0 +1,21 @@
+FROM rust:1.83.0-slim-bullseye 
+ 
+RUN apt update && apt upgrade -y 
+RUN apt install -y g++-arm-linux-gnueabi libc6-dev-armel-cross
+
+RUN rustup target add arm-unknown-linux-gnueabi
+ 
+RUN dpkg --add-architecture armel 
+RUN apt update
+#RUN apt install --assume-yes libssl-dev libssl-dev:armel pkg-config
+#                                        ^^^^^^^^^^^^^^^^
+
+#WORKDIR /app 
+ 
+ENV CARGO_TARGET_arm-unknown-linux-gnueabi_LINKER=arm-linux-gnueabi-gcc 
+ENV CC_arm-unknown-linux-gnueabi=arm-linux-gnueabi-gcc 
+ENV CXX_arm-unknown-linux-gnueabi=arm-linux-gnueabi-g++
+ENV CARGO_TARGET_arm-unknown-linux-gnueabi_LINKER=/usr/bin/arm-linux-gnueabi-gcc
+ENV PKG_CONFIG_ALLOW_CROSS="true"
+ENV PKG_CONFIG_PATH="/usr/lib/arm-linux-gnueabi/pkgconfig"
+ENV RUSTFLAGS="-L. -L /usr/arm-linux-gnueabi/lib/ -L /usr/lib/arm-linux-gnueabi/ -C link-args=-march=armv6zk -C link-args=-mtune=arm1176jzf-s"

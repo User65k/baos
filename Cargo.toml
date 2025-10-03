@@ -1,9 +1,18 @@
 [package]
 name = "baos_ctrl"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["pi"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# Pure Rust implementation - no feature flags needed
+[features]
+kdrive = []
+#default = ["kdrive"]
 
 [dependencies]
+#rumqttc = {version = "0.25", default-features = false}
+#tokio = {version = "1", features = ["rt", "net", "sync"]}
+libc = "0.2"
+termios = "0.3"
+ioctl-rs = "0.2"

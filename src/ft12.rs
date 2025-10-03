@@ -1,13 +1,7 @@
 use core::ptr::NonNull;
 use std::{
-    ffi::CString,
-    ops::{BitAnd, Shr},
-    sync::{Arc, Mutex, mpsc::Sender},
-    thread::{self, JoinHandle},
-    time::Duration,
-    io::{Read, Write},
+    ffi::CString, ops::{BitAnd, Shr}, os::fd::RawFd, sync::{mpsc::Sender, Arc, Mutex}, thread::{self, JoinHandle}, time::Duration
 };
-use serialport::SerialPort;
 
 // FT1.2 Protocol Constants
 const FT12_RESET_REQUEST: u8 = 0x10;
@@ -24,35 +18,22 @@ const GROUP_VALUE_WRITE: u16 = 0x0080;
 pub type TelegramCallback<T> = fn(*const u8, u32, Option<NonNull<T>>);
 ///cEMI message code for L_Data.ind
 pub const KDRIVE_CEMI_L_DATA_IND: u8 = 0x29;
+/// cEMI Message Code for L_Data.req
+pub const KDRIVE_CEMI_L_DATA_REQ: u8 = 0x11;
 pub const KDRIVE_MAX_GROUP_VALUE_LEN: usize = 14;
 
 // FT1.2 Frame structure
 #[derive(Debug, Clone)]
 struct Ft12Frame {
-    start: u8,      // 0x68
-    length: u8,     // Length of data part
-    length2: u8,    // Repeated length
-    start2: u8,     // 0x68 again
     control: u8,    // Control field
     data: Vec<u8>,  // Data payload
-    checksum: u8,   // Checksum
-    end: u8,        // 0x16
 }
 
 impl Ft12Frame {
-    fn new(control: u8, data: Vec<u8>) -> Self {
-        let length = (data.len() + 1) as u8; // +1 for control field
-        let checksum = Self::calculate_checksum(control, &data);
-        
+    fn new(control: u8, data: Vec<u8>) -> Self {        
         Self {
-            start: FT12_FRAME_START,
-            length,
-            length2: length,
-            start2: FT12_FRAME_START,
             control,
             data,
-            checksum,
-            end: FT12_FRAME_END,
         }
     }
     
@@ -65,34 +46,36 @@ impl Ft12Frame {
     }
     
     fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.push(self.start);
-        bytes.push(self.length);
-        bytes.push(self.length2);
-        bytes.push(self.start2);
+        let length = (self.data.len() + 1) as u8; // +1 for control field
+        let checksum = Self::calculate_checksum(self.control, &self.data);
+        let mut bytes = Vec::with_capacity(self.data.len()+7);
+        bytes.push(FT12_FRAME_START);
+        bytes.push(length);
+        bytes.push(length);
+        bytes.push(FT12_FRAME_START);
         bytes.push(self.control);
         bytes.extend_from_slice(&self.data);
-        bytes.push(self.checksum);
-        bytes.push(self.end);
+        bytes.push(checksum);
+        bytes.push(FT12_FRAME_END);
         bytes
     }
     
     fn from_bytes(bytes: &[u8]) -> Result<Self, KDriveErr> {
         if bytes.len() < 8 {
-            return Err(KDriveErr(1)); // Invalid frame length
+            return Err(KDriveErr::InvalidFrameLength); // Invalid frame length
         }
         
         if bytes[0] != FT12_FRAME_START || bytes[3] != FT12_FRAME_START {
-            return Err(KDriveErr(2)); // Invalid frame start
+            return Err(KDriveErr::InvalidFrameStart); // Invalid frame start
         }
         
         let length = bytes[1];
         if bytes[2] != length {
-            return Err(KDriveErr(3)); // Length mismatch
+            return Err(KDriveErr::LengthMismatch); // Length mismatch
         }
         
         if bytes.len() != (length as usize + 6) {
-            return Err(KDriveErr(4)); // Frame length mismatch
+            return Err(KDriveErr::FrameLengthMismatch); // Frame length mismatch
         }
         
         let control = bytes[4];
@@ -102,29 +85,23 @@ impl Ft12Frame {
         let end = bytes[5+data_len+1];
         
         if end != FT12_FRAME_END {
-            return Err(KDriveErr(5)); // Invalid frame end
+            return Err(KDriveErr::InvalidFrameEnd); // Invalid frame end
         }
         
         let expected_checksum = Self::calculate_checksum(control, &data);
         if checksum != expected_checksum {
-            return Err(KDriveErr(6)); // Checksum mismatch
+            return Err(KDriveErr::ChecksumMismatch); // Checksum mismatch
         }
         
         Ok(Self {
-            start: bytes[0],
-            length,
-            length2: bytes[2],
-            start2: bytes[3],
             control,
             data,
-            checksum,
-            end,
         })
     }
 }
 
 pub struct KDrive {
-    port: Option<Arc<Mutex<Box<dyn SerialPort>>>>,
+    port: Option<Arc<Mutex<TTYPort>>>,
     callbacks: Arc<Mutex<Vec<CallbackEntry>>>,
     stop_sender: Option<Sender<()>>,
     _receiver_thread: Option<JoinHandle<()>>,
@@ -162,15 +139,15 @@ impl KDrive {
             // Send frame
             self.send_frame(&ft12_frame)
         } else {
-            Err(KDriveErr(10)) // Not connected
+            Err(KDriveErr::NotConnected) // Not connected
         }
     }
     
     fn create_group_write_cemi(&self, addr: u16, data: &[u8]) -> Result<Vec<u8>, KDriveErr> {
-        let mut cemi = Vec::new();
+        let mut cemi = Vec::with_capacity(data.len()+10);
         
         // cEMI Message Code L_Data.req
-        cemi.push(0x11);
+        cemi.push(KDRIVE_CEMI_L_DATA_REQ);
         
         // Additional Info Length (0 = no additional info)
         cemi.push(0x00);
@@ -189,17 +166,20 @@ impl KDrive {
         cemi.push((addr >> 8) as u8);
         cemi.push((addr & 0xFF) as u8);
         
-        // Data length (NPDU + data)
-        let data_len = 1 + data.len(); // +1 for TPCI/APCI
-        cemi.push(data_len as u8);
-        
         // TPCI (Transport layer) = 0x00, APCI (Application layer) = Group Value Write (0x80)
         // For 1-byte data, encode the data value in the lower 6 bits of APCI
         if data.len() == 1 {
+            // Data length (NPDU + data)
+            cemi.push(1);
+            
             let apci = 0x0080 | (data[0] as u16 & 0x003F);
             cemi.push((apci >> 8) as u8);
             cemi.push((apci & 0xFF) as u8);
         } else {
+            // Data length (NPDU + data)
+            let data_len = 1 + data.len(); // +1 for TPCI/APCI
+            cemi.push(data_len as u8);
+
             // For multi-byte data, use standard APCI
             cemi.push(0x00); // TPCI
             cemi.push(0x80); // APCI Group Value Write
@@ -221,16 +201,17 @@ impl KDrive {
                 Ok(()) => {
                     // Wait for acknowledge
                     let mut ack_buf = [0u8; 1];
+                    port.wait_read_fd(Some(Duration::from_millis(100))).map_err(|_|KDriveErr::TimeoutWaitingForDeviceReadyIndication)?;
                     match port.read_exact(&mut ack_buf) {
                         Ok(()) if ack_buf[0] == FT12_ACKNOWLEDGE => Ok(()),
-                        Ok(()) => Err(KDriveErr(8)), // Wrong acknowledge
-                        Err(_e) => Err(KDriveErr(9)), // Read error
+                        Ok(()) => Err(KDriveErr::WrongAcknowledge), // Wrong acknowledge
+                        Err(_e) => Err(KDriveErr::ReadError), // Read error
                     }
                 }
-                Err(_e) => Err(KDriveErr(7)), // Write error
+                Err(_e) => Err(KDriveErr::WriteError), // Write error
             }
         } else {
-            Err(KDriveErr(10)) // Not connected
+            Err(KDriveErr::NotConnected) // Not connected
         }
     }
     
@@ -239,7 +220,7 @@ impl KDrive {
         func: TelegramCallback<T>,
         user_data: Option<NonNull<T>>,
     ) -> Result<u32, KDriveErr> {
-        let key = rand::random::<u32>();
+        let key = self.callbacks.lock().unwrap().len() as u32;
         
         // Type erase the callback
         let type_erased_callback: fn(*const u8, u32, Option<NonNull<()>>) = unsafe {
@@ -269,16 +250,148 @@ impl KDrive {
     }
 }
 
+struct TTYPort(RawFd);
+impl TTYPort {
+    pub fn wait_read_fd(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.wait_fd(libc::POLLIN, timeout)
+    }
+
+    fn wait_write_fd(&self, timeout: Duration) -> std::io::Result<()> {
+        self.wait_fd(libc::POLLOUT, Some(timeout))
+    }
+
+    fn wait_fd(&self, events: i16, timeout: Option<Duration>) -> std::io::Result<()> {
+        let mut fds = vec!(libc::pollfd { fd: self.0, events, revents: 0 });
+
+        let wait = Self::do_poll(&mut fds, timeout);
+
+        if wait < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        if wait == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Operation timed out"));
+        }
+
+        if fds[0].revents & events != 0 {
+            return Ok(());
+        }
+
+        if fds[0].revents & (libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+
+        Err(std::io::Error::other(""))
+    }
+    #[inline]
+    fn do_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
+        use std::ptr;
+
+        let timeout_ts;
+        let timeout = if let Some(t) = timeout {
+            timeout_ts = libc::timespec {
+                tv_sec: t.as_secs() as libc::time_t,
+                tv_nsec: t.subsec_nanos() as libc::c_long,
+            };
+            &timeout_ts
+        }else{
+            ptr::null()
+        };
+
+        unsafe {
+            libc::ppoll((fds[..]).as_mut_ptr(),
+                fds.len() as u32,
+                timeout,
+                ptr::null())
+        }
+    }
+    pub fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let len = unsafe {
+            libc::read(self.0, buf.as_mut_ptr().cast(), buf.len())
+        };
+
+        if len >= 0 {
+            Ok(len as usize)
+        }
+        else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    pub fn read_exact(&self, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut buf = buf;
+        loop {
+            self.wait_read_fd(None)?;
+            let r = self.read(buf)?;
+            match r {
+                s if s == buf.len() => return Ok(()),
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                p => buf = &mut buf[p..]
+            }
+        }
+    }
+    pub fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        self.wait_write_fd(Duration::from_millis(10))?;
+        let len = unsafe {
+            libc::write(self.0, buf.as_ptr().cast(), buf.len())
+        };
+
+        if len >= 0 {
+            Ok(len as usize)
+        }
+        else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    pub fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
+        let mut buf = buf;
+        loop {
+            let w = self.write(buf)?;
+            match w {
+                s if s == buf.len() => return Ok(()),
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                p => buf = &buf[p..]
+            }
+        }
+    }
+}
+
 pub struct KDriveFT12(KDrive);
 
 impl KDriveFT12 {
     pub fn open(mut ap: KDrive, dev: &CString) -> Result<KDriveFT12, KDriveErr> {
-        let port_name = dev.to_str().map_err(|_| KDriveErr(11))?;
-        
-        let port = serialport::new(port_name, 19200)
-            .timeout(Duration::from_millis(1000))
-            .open()
-            .map_err(|_| KDriveErr(12))?;
+        let fd = unsafe { libc::open(dev.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_LARGEFILE, 0) };
+        if fd < 0 {
+            //std::io::Error::last_os_error()
+            return Err(KDriveErr::FailedToOpenSerialPort);
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, 0) } < 0 {
+            return Err(KDriveErr::FailedToOpenSerialPort);
+        }
+        let mut termios = match termios::Termios::from_fd(fd) {
+            Ok(t) => t,
+            Err(e) => return Err(KDriveErr::FailedToOpenSerialPort),
+        };
+        let o = termios::cfgetospeed(&termios);
+        let i = termios::cfgetispeed(&termios);
+        if let Err(err) = termios::tcflush(fd, termios::TCIFLUSH) {
+            return Err(KDriveErr::FailedToOpenSerialPort);
+        }
+        if o!=i || o != termios::B19200 {
+            println!("baud rate aint cool: {} {}", o, i);
+            termios::cfsetspeed(&mut termios, termios::B19200);
+        }
+        //set magic flags from strace
+        termios.c_iflag=0x14;
+        termios.c_oflag=0x4;
+        termios.c_cflag=0xdbe;
+        termios.c_lflag=0xa20;
+        termios.c_cc = [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        //termios.c_cc[termios::VMIN]=1;
+        //termios.c_cc[termios::VTIME]=0;
+        if let Err(err) = termios::tcsetattr(fd, termios::TCSANOW, &termios) {
+            return Err(KDriveErr::FailedToOpenSerialPort);
+        }
+        let port = TTYPort(fd);
         
         ap.port = Some(Arc::new(Mutex::new(port)));
         
@@ -301,19 +414,23 @@ impl KDriveFT12 {
             let mut port = port_arc.lock().unwrap();
             // Send reset request: 10 40 40 16
             let reset_frame = [FT12_RESET_REQUEST, FT12_RESET_INDICATION, FT12_RESET_INDICATION, FT12_FRAME_END];
-            port.write_all(&reset_frame).map_err(|_| KDriveErr(13))?;
+            port.write_all(&reset_frame).map_err(|_| KDriveErr::ResetRequestFailed)?;
             
             // Wait for acknowledge
             let mut ack_buf = [0u8; 1];
-            port.read_exact(&mut ack_buf).map_err(|_| KDriveErr(14))?;
+            port.wait_read_fd(Some(Duration::from_millis(100))).map_err(|_|KDriveErr::TimeoutWaitingForDeviceReadyIndication)?;
+            port.read_exact(&mut ack_buf).map_err(|e| {
+                eprintln!("Read IO Err: {e}");
+                KDriveErr::ResetAcknowledgeFailed
+            })?;
             
             if ack_buf[0] != FT12_ACKNOWLEDGE {
-                return Err(KDriveErr(15)); // Wrong acknowledge
+                return Err(KDriveErr::WrongResetAcknowledge); // Wrong acknowledge
             }
             
             Ok(())
         } else {
-            Err(KDriveErr(10)) // Not connected
+            Err(KDriveErr::NotConnected) // Not connected
         }
     }
     
@@ -334,7 +451,7 @@ impl KDriveFT12 {
             // Step 1: Initial configuration request (line 12 in trace)
             // Request: \x68\x02\x02\x68\x73\xa7\x1a\x16
             // Expected response: \x68\x0c\x0c\x68\xf3\xa8\xff\xff\x00\xc5\x01\x03\xa2\xe2\x00\x04\xea\x16
-            let init_frame = Ft12Frame::new(FT12_DATA_REQUEST, vec![0xa7, 0x1a]);
+            let init_frame = Ft12Frame::new(FT12_DATA_REQUEST, vec![0xa7]);
             self.send_frame(&init_frame)?;
             self.expect_specific_response(&port_clone, &[FT12_DATA_CONFIRM, 0xa8, 0xff, 0xff, 0x00, 0xc5, 0x01, 0x03, 0xa2, 0xe2, 0x00, 0x04], "initial config")?;
             
@@ -371,22 +488,18 @@ impl KDriveFT12 {
             // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x00\x01\x38\x10\x01\x00\x37\x4f\x16
             let prop5_frame = Ft12Frame::new(0x53, vec![0xfc, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01]);
             self.send_frame(&prop5_frame)?;
-            self.expect_specific_response(&port_clone, &[FT12_DATA_INDICATION, 0xfb, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01, 0x00], "property read 5")?;
-            
-            // Step 7: Wait for device ready indication (line 43-46)
-            // Expected: \x68\x0c\x0c\x68\xf3\x29\x00\xbc\xd0\x10\x01\x00\x01\x01\x00\x80\x3b\x16
-            self.expect_device_ready_indication(&port_clone)?;
+            self.expect_specific_response(&port_clone, &[FT12_DATA_INDICATION, 0xfb, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01, 0x00, 0x37], "property read 5")?;
             
             println!("KNX device initialization completed successfully");
             Ok(())
         } else {
-            Err(KDriveErr(10)) // Not connected
+            Err(KDriveErr::NotConnected) // Not connected
         }
     }
     
     fn expect_specific_response(
         &self, 
-        port_arc: &Arc<Mutex<Box<dyn SerialPort>>>, 
+        port_arc: &Arc<Mutex<TTYPort>>, 
         expected_data: &[u8], 
         step_name: &str
     ) -> Result<(), KDriveErr> {
@@ -396,6 +509,7 @@ impl KDriveFT12 {
         
         // Read response with timeout
         for _attempt in 0..20 {
+            port.wait_read_fd(Some(Duration::from_secs(10))).map_err(|_|KDriveErr::TimeoutWaitingForDeviceReadyIndication)?;
             match port.read(&mut temp_buf) {
                 Ok(bytes_read) if bytes_read > 0 => {
                     response_buffer.extend_from_slice(&temp_buf[..bytes_read]);
@@ -405,20 +519,16 @@ impl KDriveFT12 {
                         // Parse FT1.2 frame
                         match Ft12Frame::from_bytes(&frame_data) {
                             Ok(frame) => {
-                                println!("Step '{}': Received response with control=0x{:02x}, data len={}", 
-                                    step_name, frame.control, frame.data.len());
-                                
                                 // Validate response data matches expected
-                                if frame_data.starts_with(expected_data) {
+                                if frame.data == expected_data[1..] && frame.control == expected_data[0] {
                                     // Send acknowledgment
-                                    port.write_all(&[FT12_ACKNOWLEDGE]).map_err(|_| KDriveErr(29))?;
-                                    println!("Step '{}': Response validated successfully", step_name);
+                                    port.write_all(&[FT12_ACKNOWLEDGE]).map_err(|_| KDriveErr::FailedToSendResponseAck2)?;
                                     return Ok(());
                                 } else {
                                     println!("Step '{}': Unexpected response data", step_name);
-                                    println!("Expected: {:02x?}", expected_data);
-                                    println!("Received: {:02x?}", &frame_data[..expected_data.len().min(frame_data.len())]);
-                                    return Err(KDriveErr(30)); // Unexpected response data
+                                    println!("Expected: {:02x?}", &expected_data[1..]);
+                                    println!("Received: {:02x?}", &frame.data[..expected_data.len().min(frame.data.len())]);
+                                    return Err(KDriveErr::UnexpectedResponseDataDuringInitialization); // Unexpected response data
                                 }
                             }
                             Err(e) => {
@@ -437,62 +547,13 @@ impl KDriveFT12 {
                 }
                 Err(e) => {
                     println!("Step '{}': Read error: {}", step_name, e);
-                    return Err(KDriveErr(31)); // Read error
+                    return Err(KDriveErr::ReadErrorDuringResponseValidation); // Read error
                 }
             }
         }
         
         println!("Step '{}': Timeout waiting for response", step_name);
-        Err(KDriveErr(32)) // Timeout
-    }
-    
-    fn expect_device_ready_indication(
-        &self, 
-        port_arc: &Arc<Mutex<Box<dyn SerialPort>>>
-    ) -> Result<(), KDriveErr> {
-        let mut port = port_arc.lock().unwrap();
-        let mut response_buffer = Vec::new();
-        let mut temp_buf = [0u8; 64];
-        
-        // Expected pattern from trace line 43-46: \xf3\x29\x00\xbc\xd0\x10\x01\x00\x01\x01\x00\x80
-        let ready_pattern = [FT12_DATA_CONFIRM, 0x29, 0x00, 0xbc, 0xd0, 0x10, 0x01, 0x00, 0x01, 0x01, 0x00, 0x80];
-        
-        println!("Waiting for device ready indication...");
-        
-        // Read response with extended timeout for device ready
-        for attempt in 0..40 {
-            match port.read(&mut temp_buf) {
-                Ok(bytes_read) if bytes_read > 0 => {
-                    response_buffer.extend_from_slice(&temp_buf[..bytes_read]);
-                    
-                    // Look for the ready pattern in the buffer
-                    if response_buffer.windows(ready_pattern.len()).any(|window| window == ready_pattern) {
-                        // Send acknowledgment
-                        port.write_all(&[FT12_ACKNOWLEDGE]).map_err(|_| KDriveErr(33))?;
-                        println!("Device ready indication received and acknowledged");
-                        return Ok(());
-                    }
-                    
-                    // Keep only recent data to prevent buffer overflow
-                    if response_buffer.len() > 256 {
-                        response_buffer.drain(0..128);
-                    }
-                }
-                Ok(_) => {
-                    thread::sleep(Duration::from_millis(100));
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    continue;
-                }
-                Err(e) => {
-                    println!("Device ready: Read error: {}", e);
-                    return Err(KDriveErr(34)); // Read error
-                }
-            }
-        }
-        
-        println!("Timeout waiting for device ready indication");
-        Err(KDriveErr(35)) // Timeout
+        Err(KDriveErr::TimeoutWaitingForInitializationResponse2) // Timeout
     }
     
     fn extract_complete_frame(&self, buffer: &[u8]) -> Option<Vec<u8>> {
@@ -520,42 +581,32 @@ impl KDriveFT12 {
             
             let _handle = thread::spawn(move || {
                 let mut buffer = vec![0u8; 256];
-                let mut frame_buffer = Vec::new();
                 
                 loop {
                     // Check if we should stop
-                    if let Ok(_) = stop_receiver.try_recv() {
+                    if stop_receiver.try_recv().is_ok() {
                         break;
                     }
                     
                     // Read data from serial port with timeout
-                    let read_result = {
-                        let mut port = port_clone.lock().unwrap();
-                        port.read(&mut buffer)
-                    };
+                    let read_result = Self::read_and_ack_whole_frame(&port_clone, &mut buffer);
                     
                     match read_result {
-                        Ok(bytes_read) if bytes_read > 0 => {
-                            frame_buffer.extend_from_slice(&buffer[..bytes_read]);
-                            
-                            // Process complete frames
-                            while let Some(frame) = Self::extract_frame(&mut frame_buffer) {
-                                if let Err(e) = Self::process_frame(&frame, &callbacks) {
-                                    println!("Error processing frame: {}", e);
-                                }
+                        Ok(frame) => {
+                            println!("Receiver thread got frame: {:02x?}", frame);
+                            if let Err(e) = Self::process_frame(frame, &callbacks) {
+                                println!("Error processing frame: {}", e);
                             }
-                        }
-                        Ok(_) => {
-                            // No data, continue
-                            thread::sleep(Duration::from_millis(10));
+                        
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
                             // Timeout, continue
+                            println!("timeout waiting for frame");
                             continue;
                         }
                         Err(e) => {
                             println!("Serial read error: {}", e);
-                            thread::sleep(Duration::from_millis(100));
+                            return;
                         }
                     }
                 }
@@ -564,32 +615,30 @@ impl KDriveFT12 {
             self.0._receiver_thread = Some(_handle);
         }
     }
-    
-    fn extract_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-        // Look for FT1.2 frame start (0x68)
-        if let Some(start_pos) = buffer.iter().position(|&b| b == FT12_FRAME_START) {
-            if start_pos > 0 {
-                // Remove data before frame start
-                buffer.drain(0..start_pos);
-            }
-            
-            if buffer.len() >= 4 {
-                // Check if we have enough data to read the length
-                let length = buffer[1] as usize;
-                let total_frame_length = length + 6; // length + 4 header bytes + checksum + end
-                
-                if buffer.len() >= total_frame_length {
-                    // We have a complete frame
-                    let frame = buffer.drain(0..total_frame_length).collect();
-                    return Some(frame);
-                }
-            }
-        } else if buffer.len() > 256 {
-            // Clear buffer if it gets too large without finding a frame start
-            buffer.clear();
+    fn read_and_ack_whole_frame<'buf>(m_port: &Arc<Mutex<TTYPort>>, buf: &'buf mut [u8]) -> std::io::Result<&'buf [u8]> {
+        let port = m_port.lock().unwrap();
+        //timeout so the lock is realeased for sending
+        port.wait_read_fd(Some(Duration::from_secs(1)))?;
+        let mut read = port.read(buf)?;
+        if read == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF reached"));
         }
-        
-        None
+        // we should not pick up stray acks here, so it needs to be a frame start
+        if buf[0] != FT12_FRAME_START {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Not a frame start"));
+        }
+        if read == 1 {
+            //only frame start read, need to read length and rest
+            port.wait_read_fd(None)?;
+            port.read_exact(&mut buf[1..4])?;
+            read = 4;
+        }
+        let length = buf[1] as usize +6;    // length + 4 header bytes + checksum + end
+        port.wait_read_fd(None)?;
+        port.read_exact(&mut buf[read..length])?;
+        //send ack
+        port.write_all(&[FT12_ACKNOWLEDGE])?;
+        Ok(&buf[..length])
     }
     
     fn process_frame(frame_data: &[u8], callbacks: &Arc<Mutex<Vec<CallbackEntry>>>) -> Result<(), KDriveErr> {
@@ -660,6 +709,39 @@ impl Drop for KDriveFT12 {
 pub struct cEMIMsg<'a> {
     data: &'a [u8],
 }
+/*
+Structure of a KNX CEMI Telegram
+
+Message Code (1 byte): 0x11 for L_Data.req
+Additional Info Length (1 byte): 0x00 if no additional info
+Control Field 1 (1 byte): e.g., 0xBC (standard frame, not repeated, broadcast, priority normal, no ack req)
+Control Field 2 (1 byte): e.g., 0xE0 (hop count 6, Extended frame format)
+Source Address (2 bytes): e.g., 0x0000 (device address)
+Destination Address (2 bytes): e.g., 0x0C00 (group address)
+Data Length (1 byte): e.g., 0x02 (NPDU + data)
+TPCI/APCI (2 bytes): e.g., 0x0080 (TPCI = 0x00, APCI = Group Value Write)
+Data (N bytes)
+
+Example FT1.2 Frame with cEMI Telegram:
+\x68\x0c\x0c\x68\x73\x11\x00\xbc\xe0\x00\x00\x10\x2f\x01\x00\x80\xe0\x16
+
+0x68 - Start of frame
+0x0c - Length of frame (12 bytes)
+0x0c - Length of frame (repeated)
+0x68 - Start of frame (repeated)
+0x73 - Control field (Data request)
+0x11 - cEMI Message Code (L_Data.req)
+0x00 - Additional Info Length
+0xbc - Control Field 1
+0xe0 - Control Field 2
+0x00 0x00 - Source Address
+0x10 0x2f - Destination Address (group address)
+0x01 - Data Length (1 byte NPDU + data)
+0x00 0x80 - TPCI/APCI (Group Value Write with data 0x00)
+0xe0 - FT1.2 Checksum
+0x16 - End of frame
+
+*/
 
 impl<'a> cEMIMsg<'a> {
     pub fn new(data: *const u8, len: u32) -> cEMIMsg<'a> {
@@ -692,7 +774,7 @@ impl<'a> cEMIMsg<'a> {
     
     pub fn get_dest(&self) -> Result<u16, KDriveErr> {
         if self.data.len() < 8 {
-            return Err(KDriveErr(16));
+            return Err(KDriveErr::CemiFrameTooShortForDestination);
         }
         Ok(u16::from_be_bytes([self.data[6], self.data[7]]))
     }
@@ -702,7 +784,7 @@ impl<'a> cEMIMsg<'a> {
         msg: &'b mut [u8; KDRIVE_MAX_GROUP_VALUE_LEN],
     ) -> Result<&'b [u8], KDriveErr> {
         if self.data.len() < 9 {
-            return Err(KDriveErr(17));
+            return Err(KDriveErr::CemiFrameTooShortForDataLength);
         }
         
         let len = self.data[8] as usize;
@@ -712,20 +794,20 @@ impl<'a> cEMIMsg<'a> {
         
         let payload_start = 10;
         if self.data.len() < payload_start + len {
-            return Err(KDriveErr(18));
+            return Err(KDriveErr::CemiFrameTruncated);
         }
         
         let payload = &self.data[payload_start..payload_start + len];
         
         // Copy payload to buffer
         if payload.len() > KDRIVE_MAX_GROUP_VALUE_LEN {
-            return Err(KDriveErr(19));
+            return Err(KDriveErr::CemiDataTooLarge);
         }
         
         msg[..payload.len()].copy_from_slice(payload);
         
         // Mask the first byte to get only the data part (remove APCI bits)
-        if payload.len() > 0 {
+        if !payload.is_empty() {
             msg[0] &= 0x3F;
         }
         
@@ -744,55 +826,73 @@ impl std::ops::Deref for cEMIMsg<'_> {
 
 /// Pure Rust KDrive Error implementation
 #[derive(Debug, Clone)]
-pub struct KDriveErr(pub u32);
+pub enum KDriveErr {
+    InvalidFrameLength,
+    InvalidFrameStart,
+    LengthMismatch,
+    FrameLengthMismatch,
+    InvalidFrameEnd,
+    ChecksumMismatch,
+    WriteError,
+    WrongAcknowledge,
+    ReadError,
+    NotConnected,
+    FailedToOpenSerialPort,
+    ResetRequestFailed,
+    ResetAcknowledgeFailed,
+    WrongResetAcknowledge,
+    CemiFrameTooShortForDestination,
+    CemiFrameTooShortForDataLength,
+    CemiFrameTruncated,
+    CemiDataTooLarge,
+    FailedToSendResponseAck,
+    TimeoutWaitingForInitializationResponse,
+    FailedToAcknowledgeDeviceReadyIndication,
+    TimeoutWaitingForDeviceReadyIndication,
+    FailedToSendResponseAck2,
+    UnexpectedResponseDataDuringInitialization,
+    ReadErrorDuringResponseValidation,
+    TimeoutWaitingForInitializationResponse2,
+}
 
 impl std::fmt::Display for KDriveErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let msg = match self.0 {
-            1 => "Invalid frame length",
-            2 => "Invalid frame start",
-            3 => "Length mismatch",
-            4 => "Frame length mismatch",
-            5 => "Invalid frame end",
-            6 => "Checksum mismatch",
-            7 => "Write error",
-            8 => "Wrong acknowledge",
-            9 => "Read error",
-            10 => "Not connected",
-            11 => "Invalid device path",
-            12 => "Failed to open serial port",
-            13 => "Reset request failed",
-            14 => "Reset acknowledge failed",
-            15 => "Wrong reset acknowledge",
-            16 => "cEMI frame too short for destination",
-            17 => "cEMI frame too short for data length",
-            18 => "cEMI frame truncated",
-            19 => "cEMI data too large",
-            20 => "Failed to send initialization frame",
-            21 => "Failed to receive initialization acknowledgment",
-            22 => "Wrong initialization acknowledgment",
-            23 => "Failed to send response acknowledgment",
-            24 => "Failed to read initialization response",
-            25 => "Timeout waiting for initialization response",
-            26 => "Failed to acknowledge device ready indication",
-            27 => "Failed to read device ready indication",
-            28 => "Timeout waiting for device ready indication",
-            29 => "Failed to send response acknowledgment",
-            30 => "Unexpected response data during initialization",
-            31 => "Read error during response validation",
-            32 => "Timeout waiting for initialization response",
-            33 => "Failed to acknowledge device ready indication",
-            34 => "Read error waiting for device ready",
-            35 => "Timeout waiting for device ready indication",
-            _ => "Unknown error",
+        use KDriveErr::*;
+        let msg = match self {
+            InvalidFrameLength => "Invalid frame length",
+            InvalidFrameStart => "Invalid frame start",
+            LengthMismatch => "Length mismatch",
+            FrameLengthMismatch => "Frame length mismatch",
+            InvalidFrameEnd => "Invalid frame end",
+            ChecksumMismatch => "Checksum mismatch",
+            WriteError => "Write error",
+            WrongAcknowledge => "Wrong acknowledge",
+            ReadError => "Read error",
+            NotConnected => "Not connected",
+            FailedToOpenSerialPort => "Failed to open serial port",
+            ResetRequestFailed => "Reset request failed",
+            ResetAcknowledgeFailed => "Reset acknowledge failed",
+            WrongResetAcknowledge => "Wrong reset acknowledge",
+            CemiFrameTooShortForDestination => "cEMI frame too short for destination",
+            CemiFrameTooShortForDataLength => "cEMI frame too short for data length",
+            CemiFrameTruncated => "cEMI frame truncated",
+            CemiDataTooLarge => "cEMI data too large",
+            FailedToSendResponseAck => "Failed to send response acknowledgment",
+            TimeoutWaitingForInitializationResponse => "Timeout waiting for initialization response",
+            FailedToAcknowledgeDeviceReadyIndication => "Failed to acknowledge device ready indication",
+            TimeoutWaitingForDeviceReadyIndication => "Timeout waiting for device ready indication",
+            FailedToSendResponseAck2 => "Failed to send response acknowledgment",
+            UnexpectedResponseDataDuringInitialization => "Unexpected response data during initialization",
+            ReadErrorDuringResponseValidation => "Read error during response validation",
+            TimeoutWaitingForInitializationResponse2 => "Timeout waiting for initialization response",
         };
-        write!(f, "KDriveErr({}): {}", self.0, msg)
+        write!(f, "KDriveErr: {}", msg)
     }
 }
 impl std::error::Error for KDriveErr {}
 
 impl From<KDriveErr> for std::io::Error {
     fn from(error: KDriveErr) -> Self {
-        std::io::Error::new(std::io::ErrorKind::Other, error)
+        std::io::Error::other(error)
     }
 }

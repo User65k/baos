@@ -46,7 +46,11 @@ fn main() {
         track_movements(receiver, states);
     });
 
+    #[cfg(not(feature="kdrive"))]
     k.register_telegram_callback(on_telegram, NonNull::new(&mut sender as *mut _))
+        .expect("could not set callback");
+    #[cfg(feature="kdrive")]
+    k.register_telegram_callback(on_telegram_c, NonNull::new(&mut sender as *mut _))
         .expect("could not set callback");
 
     let (sender, receiver) = channel::<(u16, Direction)>();
@@ -221,6 +225,14 @@ fn get_addr(c: &[u8]) -> std::io::Result<Blind> {
             return Err(std::io::ErrorKind::InvalidData.into());
         }
     })
+}
+#[cfg(feature="kdrive")]
+extern "C" fn on_telegram_c(
+    data: *const u8,
+    len: u32,
+    user_data: Option<NonNull<Sender<ChannelMsg>>>,
+) {
+    on_telegram(data, len, user_data);
 }
 fn on_telegram(
     data: *const u8,
