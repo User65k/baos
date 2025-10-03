@@ -9,7 +9,7 @@ via KNX. It is in turn controlling my Venetian blinds.
 The device is listening to `group_write`.
 The value written is either `0x0` ascend or `0x1` descend.
 
-The circuits `A` to `H` mapped to an contiguous address range on the bus.
+The circuts `A` to `H` mapped to an contiguous address range on the bus.
 This address is added to `0x1100` to move a single step and to `0x1000` to move all the way.
 
 Group ID `0` is the wind sensor. If it transmits `1` everything goes all the way up. Otherwise it transmits `0` and everything stays wherever it is.
@@ -20,7 +20,7 @@ Run `cargo build --release` (on a Pi) or `cross b -r --target arm-unknown-linux-
 
 ## with libkdriveExpress
 
-Up until commit #d8c8b50dec17e6e52807fded3205aa366b779e0a `libkdriveExpress.so` was required to reside in the repos root.
+Up until commit [d8c8b50](https://github.com/User65k/baos/commit/d8c8b50dec17e6e52807fded3205aa366b779e0a) `libkdriveExpress.so` was required to reside in the repos root.
 I think I got the library from [rpi-kdriveexpress-monitor](https://github.com/marssys/rpi-kdriveexpress-monitor)
 
 ```
@@ -28,7 +28,7 @@ md5sum baos_ctrl/libkdriveExpress.so
 5e47f74ec10b8e35e4a852bc99b77674  baos_ctrl/libkdriveExpress.so
 ```
 
-# run
+# TCP (Feature flag `socket`, default)
 
 The program will listen on port 1337 for TCP connections.
 You can send it `T C` where `T` is the target (or a Group like `A` for all) and `C` is the command:
@@ -42,20 +42,16 @@ You can send it `T C` where `T` is the target (or a Group like `A` for all) and 
 | S | Stop      |
 | D | Step Down |
 | U | Step Up   |
+| 0x80+`pos`,`angle` (2 bytes) | where `pos` is 0-100 and `angle` is 0-7|
 
-Stop equals Step Down like on the included remote
+Stop equals Step Down like on the included remote.
 
-# Python & systemd controller
-
-`./python_systemd/` contains some python files (that I have in my `/home/pi/` folder) and some systemd timers and units (from `/etc/systemd/system/`) to trigger those at sundown (`j_zu`), 8am (`j_auf`) and during the summer when the sun is shining in (`j_schatten`).
-
-Astronomic calculations are done via `astral`
-
-# MQTT
+# MQTT (Feature flag `mqtt`, default)
 
 A connection to a MQTT Broker is established and state and remote control according to  
 [Home Assistant](https://www.home-assistant.io/integrations/cover.mqtt/) is published/subscribed.
 
+The HA configuration for circut `A` would look like this:
 ```yaml
 mqtt:
   - cover:
@@ -64,7 +60,7 @@ mqtt:
       state_topic: "cover/a/state"
       position_topic: "cover/a/position"
       availability:
-        - topic: "cover/a/availability"
+        - topic: "cover/availability"
       qos: 0
       tilt_command_topic: "cover/a/tilt"
       tilt_status_topic: "cover/a/tilt-state"
@@ -74,3 +70,9 @@ mqtt:
       tilt_opened_value: 7
       unique_id: "knx.cover"
 ```
+
+# Python & systemd controller
+
+`./python_systemd/` contains some python files (that I have in my `/home/pi/` folder) and some systemd timers and units (from `/etc/systemd/system/`) to trigger those at sundown (`j_zu`), 8am (`j_auf`) and during the summer when the sun is shining in (`j_schatten`).
+
+Astronomic calculations are done via `astral`
