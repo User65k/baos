@@ -1,21 +1,24 @@
 use core::ptr::NonNull;
 use std::{
-    ffi::CString, ops::{BitAnd, Shr}, os::fd::RawFd, sync::{mpsc::Sender, Arc, Mutex}, thread::{self, JoinHandle}, time::Duration
+    ffi::CString, ops::{BitAnd, Shr}, os::fd::{AsRawFd, RawFd}
 };
+
+use tokio::{io::{unix::AsyncFd, Interest}, sync::SemaphorePermit};
 
 // FT1.2 Protocol Constants
 const FT12_RESET_REQUEST: u8 = 0x10;
 const FT12_RESET_INDICATION: u8 = 0x40;
-const FT12_DATA_REQUEST: u8 = 0x73;
-const FT12_DATA_CONFIRM: u8 = 0xF3;
-const FT12_DATA_INDICATION: u8 = 0xD3;
+//https://weinzierl.de/images/download/products/770/knx_baos_protocol.pdf
+const FT12_CTRL_HOST_ODD: u8 = 0x73;
+const FT12_CTRL_HOST_EVEN: u8 = 0x53;
+const FT12_CTRL_SRV_ODD: u8 = 0xF3;
+const FT12_CTRL_SRV_EVEN: u8 = 0xD3;
+
 const FT12_ACKNOWLEDGE: u8 = 0xE5;
 const FT12_FRAME_START: u8 = 0x68;
 const FT12_FRAME_END: u8 = 0x16;
 
 // Service codes
-const GROUP_VALUE_WRITE: u16 = 0x0080;
-pub type TelegramCallback<T> = fn(*const u8, u32, Option<NonNull<T>>);
 ///cEMI message code for L_Data.ind
 pub const KDRIVE_CEMI_L_DATA_IND: u8 = 0x29;
 /// cEMI Message Code for L_Data.req
@@ -24,9 +27,9 @@ pub const KDRIVE_MAX_GROUP_VALUE_LEN: usize = 14;
 
 // FT1.2 Frame structure
 #[derive(Debug, Clone)]
-struct Ft12Frame {
-    control: u8,    // Control field
-    data: Vec<u8>,  // Data payload
+pub struct Ft12Frame {
+    pub control: u8,    // Control field
+    pub data: Vec<u8>,  // Data payload
 }
 
 impl Ft12Frame {
@@ -100,50 +103,296 @@ impl Ft12Frame {
     }
 }
 
-pub struct KDrive {
-    port: Option<Arc<Mutex<TTYPort>>>,
-    callbacks: Arc<Mutex<Vec<CallbackEntry>>>,
-    stop_sender: Option<Sender<()>>,
-    _receiver_thread: Option<JoinHandle<()>>,
-}
-
-struct CallbackEntry {
-    callback: fn(*const u8, u32, Option<NonNull<()>>),
-    user_data: Option<NonNull<()>>,
-    key: u32,
-}
-
-// SAFETY: CallbackEntry is thread-safe as long as the callback function and user_data
-// are valid across thread boundaries. The user is responsible for ensuring this.
-unsafe impl Send for CallbackEntry {}
-unsafe impl Sync for CallbackEntry {}
-
-impl KDrive {
-    pub fn new() -> Result<KDrive, ()> {
-        Ok(KDrive {
-            port: None,
-            callbacks: Arc::new(Mutex::new(Vec::new())),
-            stop_sender: None,
-            _receiver_thread: None,
-        })
+struct TTYPort(AsyncFd<RawFd>);
+impl TTYPort {
+    pub async fn wait_readable(&self) -> std::io::Result<()> {
+        self.0.readable().await.map(|_|())
     }
-    
-    pub fn group_write(&mut self, addr: u16, data: &[u8]) -> Result<(), KDriveErr> {
-        if self.port.is_some() {
-            // Create cEMI frame for group write
-            let cemi_frame = self.create_group_write_cemi(addr, data)?;
-            
-            // Wrap in FT1.2 frame
-            let ft12_frame = Ft12Frame::new(FT12_DATA_REQUEST, cemi_frame);
-            
-            // Send frame
-            self.send_frame(&ft12_frame)
-        } else {
-            Err(KDriveErr::NotConnected) // Not connected
+    pub fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.try_io(Interest::READABLE, |fd|Self::blocking_read(*fd, buf))
+    }
+    pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.async_io(Interest::READABLE, |fd|Self::blocking_read(*fd, buf)).await
+    }
+    fn blocking_read(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+        let len = unsafe {
+            libc::read(fd, buf.as_mut_ptr().cast(), buf.len())
+        };
+
+        if len >= 0 {
+            println!("read({:x?})", &buf[..len as usize]);
+            Ok(len as usize)
+        }
+        else {
+            Err(std::io::Error::last_os_error())
         }
     }
+    pub async fn read_exact(&self, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut buf = buf;
+        loop {
+            let r = self.read(buf).await?;
+            match r {
+                s if s == buf.len() => return Ok(()),
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                p => buf = &mut buf[p..]
+            }
+        }
+    }
+    pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        let a = self.0.writable().await?;
+        let len = unsafe {
+            libc::write(a.get_inner().as_raw_fd(), buf.as_ptr().cast(), buf.len())
+        };
+
+        if len >= 0 {
+            println!("write({:x?})", &buf[..len as usize]);
+            Ok(len as usize)
+        }
+        else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    pub async fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
+        let mut buf = buf;
+        loop {
+            let w = self.write(buf).await?;
+            match w {
+                s if s == buf.len() => return Ok(()),
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                p => buf = &buf[p..]
+            }
+        }
+    }
+}
+struct FT12Dev {
+    ///the bus is in use (waiting for more data to read)
+    s: tokio::sync::Semaphore,
+    d: TTYPort,
+    /// protected by semaphore
+    recv_odd: std::cell::UnsafeCell<bool>,
+    /// protected by semaphore
+    send_odd: std::cell::UnsafeCell<bool>,
+}
+impl FT12Dev {
+    pub fn new(dev: &CString) -> std::io::Result<Self> {
+        let fd = unsafe { libc::open(dev.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_LARGEFILE, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut termios = termios::Termios::from_fd(fd)?;
+        let o = termios::cfgetospeed(&termios);
+        let i = termios::cfgetispeed(&termios);
+        termios::tcflush(fd, termios::TCIFLUSH)?;
+        if o!=i || o != termios::B19200 {
+            println!("baud rate aint cool: {} {}", o, i);
+            termios::cfsetspeed(&mut termios, termios::B19200)?;
+        }
+        //set magic flags from strace
+        termios.c_iflag=0x14;
+        termios.c_oflag=0x4;
+        termios.c_cflag=0xdbe;
+        termios.c_lflag=0xa20;
+        termios.c_cc = [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        //termios.c_cc[termios::VMIN]=1;
+        //termios.c_cc[termios::VTIME]=0;
+        termios::tcsetattr(fd, termios::TCSANOW, &termios)?;
+        let port = TTYPort(AsyncFd::new(fd)?);
+        Ok(FT12Dev{d: port, s: tokio::sync::Semaphore::new(1), recv_odd: true.into(), send_odd: true.into()})
+    }
+    pub async fn reset(&mut self) -> std::io::Result<()> {
+        // Send reset request: 10 40 40 16
+        let reset_frame = [FT12_RESET_REQUEST, FT12_RESET_INDICATION, FT12_RESET_INDICATION, FT12_FRAME_END];
+        let sp =self.s.acquire().await.unwrap();
+        self.send_and_ack(&reset_frame, sp).await
+    }
+    pub async fn write(&self, data: Vec<u8>) -> std::io::Result<()> {
+        let sp =self.s.acquire().await.unwrap();
+        let control = if unsafe { self.send_odd.get().read() } {
+            unsafe { self.send_odd.get().write(false) };
+            FT12_CTRL_HOST_ODD
+        }else{
+            unsafe { self.send_odd.get().write(true) };
+            FT12_CTRL_HOST_EVEN
+        };
+        let frame = Ft12Frame::new(control, data);
+        self.send_and_ack(&frame.to_bytes(), sp).await
+    }
+    ///exclusively write and wait for an ack
+    async fn send_and_ack(&self, data: &[u8], sp: SemaphorePermit<'_>) -> std::io::Result<()> {     
+        self.d.write_all(data).await?;
+
+        let mut ack_buf = [0u8; 1];
+        self.d.read_exact(&mut ack_buf).await?;
+        drop(sp);
+        if ack_buf[0] != FT12_ACKNOWLEDGE {
+            return Err(std::io::ErrorKind::InvalidData.into()); // Wrong acknowledge
+        }
+        Ok(())
+    }
+    /*pub async fn blocking_read(&self, buf: &mut [u8]) -> std::io::Result<Ft12Frame> {
+        let sp =self.s.acquire().await.unwrap();
+
+        println!("read lock");
+        let read = self.d.read(buf).await?;
+        self.internal_read(read, buf, sp).await
+    }*/
+    /// wait for data to read
+    /// only exclusively read (and ack) once the initial read was successful
+    pub async fn try_read(&self, buf: &mut [u8]) -> std::io::Result<Ft12Frame> {
+        let (read, sp) = loop {
+            self.d.wait_readable().await?;
+            // there seems to be data - lock the bus and see if its true...
+            let sp =self.s.acquire().await.unwrap();
+
+            println!("read lock");
+            match self.d.try_read(buf) {
+                //no data -> release and wait again
+                Err(e) if e.kind()==std::io::ErrorKind::WouldBlock => {drop(sp);continue},
+                Err(e) => return Err(e),
+                //data! - read the rest, only release after the ack
+                Ok(n) => break (n, sp),
+            }
+        };
+        let f = self.internal_read(read, buf, sp).await?;
+
+        let expected_ctrl = if unsafe { self.recv_odd.get().read() } {
+            unsafe { self.recv_odd.get().write(false) };
+            FT12_CTRL_SRV_ODD
+        }else{
+            unsafe { self.recv_odd.get().write(true) };
+            FT12_CTRL_SRV_EVEN
+        };
+        if f.control != expected_ctrl {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "odd/even desync"));
+        }
+        Ok(f)
+    }
+    /// read a frame from the bus and ack it. needs a locked bus
+    async fn internal_read(&self, mut read: usize, buf: &mut [u8], sp: SemaphorePermit<'_>) -> std::io::Result<Ft12Frame> {
+        if read == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF reached"));
+        }
+        // we should not pick up stray acks here, so it needs to be a frame start
+        if buf[0] != FT12_FRAME_START {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Not a frame start"));
+        }
+        if read == 1 {
+            //only frame start read, need to read length and rest
+            self.d.read_exact(&mut buf[1..4]).await?;
+            read = 4;
+        }
+        let length = buf[1] as usize +6;    // length + 4 header bytes + checksum + end
+        self.d.read_exact(&mut buf[read..length]).await?;
+        //send ack
+        self.d.write_all(&[FT12_ACKNOWLEDGE]).await?;
+        drop(sp);
+        Ft12Frame::from_bytes(&buf[..length]).map_err(|e|std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
+pub struct KDriveFT12(FT12Dev);
+
+impl KDriveFT12 {
+    pub async fn open(dev: &CString) -> std::io::Result<KDriveFT12> {        
+        let mut d = FT12Dev::new(dev)?;
+        // Send reset request to initialize the connection
+        d.reset().await?;
+        let mut ft12 = KDriveFT12(d);
+        
+        // Complete device initialization sequence
+        ft12.initialize_device().await?;
+                
+        Ok(ft12)
+    }
     
-    fn create_group_write_cemi(&self, addr: u16, data: &[u8]) -> Result<Vec<u8>, KDriveErr> {
+    /// Initialize the KNX device with the complete startup sequence.
+    /// 
+    /// This method replicates the initialization sequence observed in the tty_trace:
+    /// 1. Initial configuration request
+    /// 2. Multiple property read requests for device configuration
+    /// 
+    /// The sequence is based on lines 12-46 from the trace file and establishes
+    /// proper communication with the KNX interface before normal operation begins.
+    async fn initialize_device(&mut self) -> std::io::Result<()> {
+        println!("Starting KNX device initialization...");            
+        // Step 1: Initial configuration request (line 12 in trace)
+        // Request: \x68\x02\x02\x68\x73\xa7\x1a\x16
+        // Expected response: \x68\x0c\x0c\x68\xf3\xa8\xff\xff\x00\xc5\x01\x03\xa2\xe2\x00\x04\xea\x16
+        let init_frame = vec![0xa7];
+        self.0.write(init_frame).await?;
+        self.expect_specific_response(&[0xa8, 0xff, 0xff, 0x00, 0xc5, 0x01, 0x03, 0xa2, 0xe2, 0x00, 0x04], "initial config").await?;
+        
+        // Step 2: Property read 1 (line 18)
+        // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x40\x10\x01\xa9\x16
+        // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x08\x01\x40\x10\x01\x00\x0b\x33\x16
+        let prop1_frame = vec![0xfc, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01];
+        self.0.write(prop1_frame).await?;
+        self.expect_specific_response(&[0xfb, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01, 0x00, 0x0b], "property read 1").await?;
+        
+        // Step 3: Property read 2 (line 23)
+        // Request: \x68\x09\x09\x68\x73\xf6\x00\x08\x01\x34\x10\x01\x00\xb7\x16
+        // Expected response: \x68\x08\x08\x68\xf3\xf5\x00\x08\x01\x34\x10\x01\x36\x16
+        let prop2_frame = vec![0xf6, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00];
+        self.0.write(prop2_frame).await?;
+        self.expect_specific_response(&[0xf5, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01], "property read 2").await?;
+        
+        // Step 4: Property read 3 (line 28)
+        // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x34\x10\x01\x9d\x16
+        // Expected response: \x68\x09\x09\x68\xd3\xfb\x00\x08\x01\x34\x10\x01\x00\x1c\x16
+        let prop3_frame = vec![0xfc, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01];
+        self.0.write(prop3_frame).await?;
+        self.expect_specific_response(&[0xfb, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00], "property read 3").await?;
+        
+        // Step 5: Property read 4 (line 33)
+        // Request: \x68\x08\x08\x68\x73\xfc\x00\x08\x01\x33\x10\x01\xbc\x16
+        // Expected response: \x68\x0a\x0a\x68\xf3\xfb\x00\x08\x01\x33\x10\x01\x00\x02\x3d\x16
+        let prop4_frame = vec![0xfc, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01];
+        self.0.write(prop4_frame).await?;
+        self.expect_specific_response(&[0xfb, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01, 0x00, 0x02], "property read 4").await?;
+        
+        // Step 6: Property read 5 (line 38)
+        // Request: \x68\x08\x08\x68\x53\xfc\x00\x00\x01\x38\x10\x01\x99\x16
+        // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x00\x01\x38\x10\x01\x00\x37\x4f\x16
+        let prop5_frame = vec![0xfc, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01];
+        self.0.write(prop5_frame).await?;
+        self.expect_specific_response(&[0xfb, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01, 0x00, 0x37], "property read 5").await?;
+        
+        println!("KNX device initialization completed successfully");
+        Ok(())
+    }
+    
+    async fn expect_specific_response(
+        &mut self,
+        expected_data: &[u8], 
+        step_name: &str
+    ) -> std::io::Result<()> {
+        let mut temp_buf = [0u8; 512];
+        
+        let frame = self.0.try_read(&mut temp_buf).await?;
+        // Validate response data matches expected
+        if frame.data == expected_data {
+            Ok(())
+        } else {
+            println!("Step '{}': Unexpected response data", step_name);
+            println!("Expected: {:02x?}", &expected_data);
+            println!("Received: {:02x?}", &frame.data[..expected_data.len().min(frame.data.len())]);
+            Err(std::io::ErrorKind::InvalidData.into())// Unexpected response data
+        }
+    }
+
+    
+    pub async fn group_write(&self, addr: u16, data: &[u8]) -> std::io::Result<()> {
+        // Create cEMI frame for group write
+        let cemi_frame = self.create_group_write_cemi(addr, data);
+                    
+        // Send frame
+        self.0.write(cemi_frame).await
+    }
+    
+    fn create_group_write_cemi(&self, addr: u16, data: &[u8]) -> Vec<u8> {
         let mut cemi = Vec::with_capacity(data.len()+10);
         
         // cEMI Message Code L_Data.req
@@ -176,6 +425,7 @@ impl KDrive {
             cemi.push((apci >> 8) as u8);
             cemi.push((apci & 0xFF) as u8);
         } else {
+            todo!("I think this len should be in bits");
             // Data length (NPDU + data)
             let data_len = 1 + data.len(); // +1 for TPCI/APCI
             cemi.push(data_len as u8);
@@ -190,518 +440,11 @@ impl KDrive {
             cemi.extend_from_slice(&data[1..]);
         }
         
-        Ok(cemi)
+        cemi
     }
-    
-    fn send_frame(&mut self, frame: &Ft12Frame) -> Result<(), KDriveErr> {
-        if let Some(ref port_arc) = self.port {
-            let mut port = port_arc.lock().unwrap();
-            let bytes = frame.to_bytes();
-            match port.write_all(&bytes) {
-                Ok(()) => {
-                    // Wait for acknowledge
-                    let mut ack_buf = [0u8; 1];
-                    port.wait_read_fd(Some(Duration::from_millis(100))).map_err(|_|KDriveErr::TimeoutWaitingForDeviceReadyIndication)?;
-                    match port.read_exact(&mut ack_buf) {
-                        Ok(()) if ack_buf[0] == FT12_ACKNOWLEDGE => Ok(()),
-                        Ok(()) => Err(KDriveErr::WrongAcknowledge), // Wrong acknowledge
-                        Err(_e) => Err(KDriveErr::ReadError), // Read error
-                    }
-                }
-                Err(_e) => Err(KDriveErr::WriteError), // Write error
-            }
-        } else {
-            Err(KDriveErr::NotConnected) // Not connected
-        }
-    }
-    
-    pub fn register_telegram_callback<T>(
-        &mut self,
-        func: TelegramCallback<T>,
-        user_data: Option<NonNull<T>>,
-    ) -> Result<u32, KDriveErr> {
-        let key = self.callbacks.lock().unwrap().len() as u32;
-        
-        // Type erase the callback
-        let type_erased_callback: fn(*const u8, u32, Option<NonNull<()>>) = unsafe {
-            std::mem::transmute(func)
-        };
-        
-        let type_erased_user_data = user_data.map(|ptr| ptr.cast::<()>());
-        
-        let entry = CallbackEntry {
-            callback: type_erased_callback,
-            user_data: type_erased_user_data,
-            key,
-        };
-        
-        self.callbacks.lock().unwrap().push(entry);
-        Ok(key)
-    }
-    
-    pub fn recv<'a>(&self, data: &'a mut [u8], _timeout_ms: u32) -> &'a [u8] {
-        // For now, return empty slice - this would be implemented with proper timeout handling
-        &data[..0]
-    }
-    
-    /// Check if the receiver thread is currently running
-    pub fn is_receiver_active(&self) -> bool {
-        self._receiver_thread.as_ref().map_or(false, |handle| !handle.is_finished())
-    }
-}
-
-struct TTYPort(RawFd);
-impl TTYPort {
-    pub fn wait_read_fd(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.wait_fd(libc::POLLIN, timeout)
-    }
-
-    fn wait_write_fd(&self, timeout: Duration) -> std::io::Result<()> {
-        self.wait_fd(libc::POLLOUT, Some(timeout))
-    }
-
-    fn wait_fd(&self, events: i16, timeout: Option<Duration>) -> std::io::Result<()> {
-        let mut fds = vec!(libc::pollfd { fd: self.0, events, revents: 0 });
-
-        let wait = Self::do_poll(&mut fds, timeout);
-
-        if wait < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        if wait == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Operation timed out"));
-        }
-
-        if fds[0].revents & events != 0 {
-            return Ok(());
-        }
-
-        if fds[0].revents & (libc::POLLHUP | libc::POLLNVAL) != 0 {
-            return Err(std::io::ErrorKind::BrokenPipe.into());
-        }
-
-        Err(std::io::Error::other(""))
-    }
-    #[inline]
-    fn do_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
-        use std::ptr;
-
-        let timeout_ts;
-        let timeout = if let Some(t) = timeout {
-            timeout_ts = libc::timespec {
-                tv_sec: t.as_secs() as libc::time_t,
-                tv_nsec: t.subsec_nanos() as libc::c_long,
-            };
-            &timeout_ts
-        }else{
-            ptr::null()
-        };
-
-        unsafe {
-            libc::ppoll((fds[..]).as_mut_ptr(),
-                fds.len() as u32,
-                timeout,
-                ptr::null())
-        }
-    }
-    pub fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let len = unsafe {
-            libc::read(self.0, buf.as_mut_ptr().cast(), buf.len())
-        };
-
-        if len >= 0 {
-            Ok(len as usize)
-        }
-        else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
-    pub fn read_exact(&self, buf: &mut [u8]) -> std::io::Result<()> {
-        let mut buf = buf;
-        loop {
-            self.wait_read_fd(None)?;
-            let r = self.read(buf)?;
-            match r {
-                s if s == buf.len() => return Ok(()),
-                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-                p => buf = &mut buf[p..]
-            }
-        }
-    }
-    pub fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.wait_write_fd(Duration::from_millis(10))?;
-        let len = unsafe {
-            libc::write(self.0, buf.as_ptr().cast(), buf.len())
-        };
-
-        if len >= 0 {
-            Ok(len as usize)
-        }
-        else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
-    pub fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
-        let mut buf = buf;
-        loop {
-            let w = self.write(buf)?;
-            match w {
-                s if s == buf.len() => return Ok(()),
-                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-                p => buf = &buf[p..]
-            }
-        }
-    }
-}
-
-pub struct KDriveFT12(KDrive);
-
-impl KDriveFT12 {
-    pub fn open(mut ap: KDrive, dev: &CString) -> Result<KDriveFT12, KDriveErr> {
-        let fd = unsafe { libc::open(dev.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_LARGEFILE, 0) };
-        if fd < 0 {
-            //std::io::Error::last_os_error()
-            return Err(KDriveErr::FailedToOpenSerialPort);
-        }
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, 0) } < 0 {
-            return Err(KDriveErr::FailedToOpenSerialPort);
-        }
-        let mut termios = match termios::Termios::from_fd(fd) {
-            Ok(t) => t,
-            Err(e) => return Err(KDriveErr::FailedToOpenSerialPort),
-        };
-        let o = termios::cfgetospeed(&termios);
-        let i = termios::cfgetispeed(&termios);
-        if let Err(err) = termios::tcflush(fd, termios::TCIFLUSH) {
-            return Err(KDriveErr::FailedToOpenSerialPort);
-        }
-        if o!=i || o != termios::B19200 {
-            println!("baud rate aint cool: {} {}", o, i);
-            termios::cfsetspeed(&mut termios, termios::B19200);
-        }
-        //set magic flags from strace
-        termios.c_iflag=0x14;
-        termios.c_oflag=0x4;
-        termios.c_cflag=0xdbe;
-        termios.c_lflag=0xa20;
-        termios.c_cc = [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        //termios.c_cc[termios::VMIN]=1;
-        //termios.c_cc[termios::VTIME]=0;
-        if let Err(err) = termios::tcsetattr(fd, termios::TCSANOW, &termios) {
-            return Err(KDriveErr::FailedToOpenSerialPort);
-        }
-        let port = TTYPort(fd);
-        
-        ap.port = Some(Arc::new(Mutex::new(port)));
-        
-        let mut ft12 = KDriveFT12(ap);
-        
-        // Send reset request to initialize the connection
-        ft12.send_reset()?;
-        
-        // Complete device initialization sequence
-        ft12.initialize_device()?;
-        
-        // Start receiver thread
-        ft12.start_receiver_thread();
-        
-        Ok(ft12)
-    }
-    
-    fn send_reset(&mut self) -> Result<(), KDriveErr> {
-        if let Some(ref port_arc) = self.0.port {
-            let mut port = port_arc.lock().unwrap();
-            // Send reset request: 10 40 40 16
-            let reset_frame = [FT12_RESET_REQUEST, FT12_RESET_INDICATION, FT12_RESET_INDICATION, FT12_FRAME_END];
-            port.write_all(&reset_frame).map_err(|_| KDriveErr::ResetRequestFailed)?;
-            
-            // Wait for acknowledge
-            let mut ack_buf = [0u8; 1];
-            port.wait_read_fd(Some(Duration::from_millis(100))).map_err(|_|KDriveErr::TimeoutWaitingForDeviceReadyIndication)?;
-            port.read_exact(&mut ack_buf).map_err(|e| {
-                eprintln!("Read IO Err: {e}");
-                KDriveErr::ResetAcknowledgeFailed
-            })?;
-            
-            if ack_buf[0] != FT12_ACKNOWLEDGE {
-                return Err(KDriveErr::WrongResetAcknowledge); // Wrong acknowledge
-            }
-            
-            Ok(())
-        } else {
-            Err(KDriveErr::NotConnected) // Not connected
-        }
-    }
-    
-    /// Initialize the KNX device with the complete startup sequence.
-    /// 
-    /// This method replicates the initialization sequence observed in the tty_trace:
-    /// 1. Initial configuration request
-    /// 2. Multiple property read requests for device configuration
-    /// 
-    /// The sequence is based on lines 12-46 from the trace file and establishes
-    /// proper communication with the KNX interface before normal operation begins.
-    fn initialize_device(&mut self) -> Result<(), KDriveErr> {
-        println!("Starting KNX device initialization...");
-        
-        if let Some(ref port_arc) = self.0.port {
-            let port_clone = Arc::clone(port_arc);
-            
-            // Step 1: Initial configuration request (line 12 in trace)
-            // Request: \x68\x02\x02\x68\x73\xa7\x1a\x16
-            // Expected response: \x68\x0c\x0c\x68\xf3\xa8\xff\xff\x00\xc5\x01\x03\xa2\xe2\x00\x04\xea\x16
-            let init_frame = Ft12Frame::new(FT12_DATA_REQUEST, vec![0xa7]);
-            self.send_frame(&init_frame)?;
-            self.expect_specific_response(&port_clone, &[FT12_DATA_CONFIRM, 0xa8, 0xff, 0xff, 0x00, 0xc5, 0x01, 0x03, 0xa2, 0xe2, 0x00, 0x04], "initial config")?;
-            
-            // Step 2: Property read 1 (line 18)
-            // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x40\x10\x01\xa9\x16
-            // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x08\x01\x40\x10\x01\x00\x0b\x33\x16
-            let prop1_frame = Ft12Frame::new(0x53, vec![0xfc, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01]);
-            self.send_frame(&prop1_frame)?;
-            self.expect_specific_response(&port_clone, &[FT12_DATA_INDICATION, 0xfb, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01, 0x00, 0x0b], "property read 1")?;
-            
-            // Step 3: Property read 2 (line 23)
-            // Request: \x68\x09\x09\x68\x73\xf6\x00\x08\x01\x34\x10\x01\x00\xb7\x16
-            // Expected response: \x68\x08\x08\x68\xf3\xf5\x00\x08\x01\x34\x10\x01\x36\x16
-            let prop2_frame = Ft12Frame::new(FT12_DATA_REQUEST, vec![0xf6, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00]);
-            self.send_frame(&prop2_frame)?;
-            self.expect_specific_response(&port_clone, &[FT12_DATA_CONFIRM, 0xf5, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01], "property read 2")?;
-            
-            // Step 4: Property read 3 (line 28)
-            // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x34\x10\x01\x9d\x16
-            // Expected response: \x68\x09\x09\x68\xd3\xfb\x00\x08\x01\x34\x10\x01\x00\x1c\x16
-            let prop3_frame = Ft12Frame::new(0x53, vec![0xfc, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01]);
-            self.send_frame(&prop3_frame)?;
-            self.expect_specific_response(&port_clone, &[FT12_DATA_INDICATION, 0xfb, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00], "property read 3")?;
-            
-            // Step 5: Property read 4 (line 33)
-            // Request: \x68\x08\x08\x68\x73\xfc\x00\x08\x01\x33\x10\x01\xbc\x16
-            // Expected response: \x68\x0a\x0a\x68\xf3\xfb\x00\x08\x01\x33\x10\x01\x00\x02\x3d\x16
-            let prop4_frame = Ft12Frame::new(FT12_DATA_REQUEST, vec![0xfc, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01]);
-            self.send_frame(&prop4_frame)?;
-            self.expect_specific_response(&port_clone, &[FT12_DATA_CONFIRM, 0xfb, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01, 0x00, 0x02], "property read 4")?;
-            
-            // Step 6: Property read 5 (line 38)
-            // Request: \x68\x08\x08\x68\x53\xfc\x00\x00\x01\x38\x10\x01\x99\x16
-            // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x00\x01\x38\x10\x01\x00\x37\x4f\x16
-            let prop5_frame = Ft12Frame::new(0x53, vec![0xfc, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01]);
-            self.send_frame(&prop5_frame)?;
-            self.expect_specific_response(&port_clone, &[FT12_DATA_INDICATION, 0xfb, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01, 0x00, 0x37], "property read 5")?;
-            
-            println!("KNX device initialization completed successfully");
-            Ok(())
-        } else {
-            Err(KDriveErr::NotConnected) // Not connected
-        }
-    }
-    
-    fn expect_specific_response(
-        &self, 
-        port_arc: &Arc<Mutex<TTYPort>>, 
-        expected_data: &[u8], 
-        step_name: &str
-    ) -> Result<(), KDriveErr> {
-        let mut port = port_arc.lock().unwrap();
-        let mut response_buffer = Vec::new();
-        let mut temp_buf = [0u8; 64];
-        
-        // Read response with timeout
-        for _attempt in 0..20 {
-            port.wait_read_fd(Some(Duration::from_secs(10))).map_err(|_|KDriveErr::TimeoutWaitingForDeviceReadyIndication)?;
-            match port.read(&mut temp_buf) {
-                Ok(bytes_read) if bytes_read > 0 => {
-                    response_buffer.extend_from_slice(&temp_buf[..bytes_read]);
-                    
-                    // Try to parse complete frame
-                    if let Some(frame_data) = self.extract_complete_frame(&response_buffer) {
-                        // Parse FT1.2 frame
-                        match Ft12Frame::from_bytes(&frame_data) {
-                            Ok(frame) => {
-                                // Validate response data matches expected
-                                if frame.data == expected_data[1..] && frame.control == expected_data[0] {
-                                    // Send acknowledgment
-                                    port.write_all(&[FT12_ACKNOWLEDGE]).map_err(|_| KDriveErr::FailedToSendResponseAck2)?;
-                                    return Ok(());
-                                } else {
-                                    println!("Step '{}': Unexpected response data", step_name);
-                                    println!("Expected: {:02x?}", &expected_data[1..]);
-                                    println!("Received: {:02x?}", &frame.data[..expected_data.len().min(frame.data.len())]);
-                                    return Err(KDriveErr::UnexpectedResponseDataDuringInitialization); // Unexpected response data
-                                }
-                            }
-                            Err(e) => {
-                                println!("Step '{}': Failed to parse response frame: {}", step_name, e);
-                                continue;
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {
-                    // No data, wait a bit
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    continue;
-                }
-                Err(e) => {
-                    println!("Step '{}': Read error: {}", step_name, e);
-                    return Err(KDriveErr::ReadErrorDuringResponseValidation); // Read error
-                }
-            }
-        }
-        
-        println!("Step '{}': Timeout waiting for response", step_name);
-        Err(KDriveErr::TimeoutWaitingForInitializationResponse2) // Timeout
-    }
-    
-    fn extract_complete_frame(&self, buffer: &[u8]) -> Option<Vec<u8>> {
-        // Look for FT1.2 frame start (0x68)
-        if let Some(start_pos) = buffer.iter().position(|&b| b == FT12_FRAME_START) {
-            if buffer.len() >= start_pos + 4 {
-                let length = buffer[start_pos + 1] as usize;
-                let total_frame_length = length + 6; // length + 4 header bytes + checksum + end
-                
-                if buffer.len() >= start_pos + total_frame_length {
-                    return Some(buffer[start_pos..start_pos + total_frame_length].to_vec());
-                }
-            }
-        }
-        None
-    }
-    
-    fn start_receiver_thread(&mut self) {
-        if let Some(ref port_arc) = self.0.port {
-            let callbacks = Arc::clone(&self.0.callbacks);
-            let port_clone = Arc::clone(port_arc);
-            let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
-            
-            self.0.stop_sender = Some(stop_sender);
-            
-            let _handle = thread::spawn(move || {
-                let mut buffer = vec![0u8; 256];
-                
-                loop {
-                    // Check if we should stop
-                    if stop_receiver.try_recv().is_ok() {
-                        break;
-                    }
-                    
-                    // Read data from serial port with timeout
-                    let read_result = Self::read_and_ack_whole_frame(&port_clone, &mut buffer);
-                    
-                    match read_result {
-                        Ok(frame) => {
-                            println!("Receiver thread got frame: {:02x?}", frame);
-                            if let Err(e) = Self::process_frame(frame, &callbacks) {
-                                println!("Error processing frame: {}", e);
-                            }
-                        
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                            // Timeout, continue
-                            println!("timeout waiting for frame");
-                            continue;
-                        }
-                        Err(e) => {
-                            println!("Serial read error: {}", e);
-                            return;
-                        }
-                    }
-                }
-            });
-            
-            self.0._receiver_thread = Some(_handle);
-        }
-    }
-    fn read_and_ack_whole_frame<'buf>(m_port: &Arc<Mutex<TTYPort>>, buf: &'buf mut [u8]) -> std::io::Result<&'buf [u8]> {
-        let port = m_port.lock().unwrap();
-        //timeout so the lock is realeased for sending
-        port.wait_read_fd(Some(Duration::from_secs(1)))?;
-        let mut read = port.read(buf)?;
-        if read == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF reached"));
-        }
-        // we should not pick up stray acks here, so it needs to be a frame start
-        if buf[0] != FT12_FRAME_START {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Not a frame start"));
-        }
-        if read == 1 {
-            //only frame start read, need to read length and rest
-            port.wait_read_fd(None)?;
-            port.read_exact(&mut buf[1..4])?;
-            read = 4;
-        }
-        let length = buf[1] as usize +6;    // length + 4 header bytes + checksum + end
-        port.wait_read_fd(None)?;
-        port.read_exact(&mut buf[read..length])?;
-        //send ack
-        port.write_all(&[FT12_ACKNOWLEDGE])?;
-        Ok(&buf[..length])
-    }
-    
-    fn process_frame(frame_data: &[u8], callbacks: &Arc<Mutex<Vec<CallbackEntry>>>) -> Result<(), KDriveErr> {
-        // Handle single-byte acknowledge
-        if frame_data.len() == 1 && frame_data[0] == FT12_ACKNOWLEDGE {
-            // Just an acknowledge, ignore
-            return Ok(());
-        }
-        
-        // Parse FT1.2 frame
-        let frame = Ft12Frame::from_bytes(frame_data)?;
-        
-        // Check if this is a data indication (incoming telegram)
-        if frame.control == FT12_DATA_INDICATION {
-            // Extract cEMI data from frame
-            let cemi_data = &frame.data;
-            
-            // Dispatch to callbacks
-            let callbacks_guard = callbacks.lock().unwrap();
-            for entry in callbacks_guard.iter() {
-                // Call the callback with cEMI data
-                (entry.callback)(
-                    cemi_data.as_ptr(),
-                    cemi_data.len() as u32,
-                    entry.user_data,
-                );
-            }
-        }
-        
-        Ok(())
-    }
-}
-impl core::ops::Deref for KDriveFT12 {
-    type Target = KDrive;
-    fn deref(&self) -> &KDrive {
-        &self.0
-    }
-}
-
-impl core::ops::DerefMut for KDriveFT12 {
-    fn deref_mut(&mut self) -> &mut KDrive {
-        &mut self.0
-    }
-}
-
-impl Drop for KDrive {
-    fn drop(&mut self) {
-        // Signal receiver thread to stop
-        if let Some(ref stop_sender) = self.stop_sender {
-            let _ = stop_sender.send(());
-        }
-        
-        // Wait for receiver thread to finish
-        if let Some(handle) = self._receiver_thread.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for KDriveFT12 {
-    fn drop(&mut self) {
-        // KDrive's drop will handle the receiver thread cleanup
-        // Serial port cleanup is handled by SerialPort's Drop implementation
+    ///returns a cEMI Message
+    pub async fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<Vec<u8>> {
+        Ok(self.0.try_read(buf).await?.data)
     }
 }
 
