@@ -1,6 +1,6 @@
 This is using a [kBerry](https://github.com/yene/kBerry) to control this
 
-![jal-0810.02](./jal-0810.02.jpeg)
+[![jal-0810.02](./jal-0810.02.jpeg)](https://www.mdt.de/produkte/produktdetail/aktorik/jalousieaktoren/jalousieaktor-jal.html)
 
 via KNX. It is in turn controlling my Venetian blinds.
 

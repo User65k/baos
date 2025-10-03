@@ -1,8 +1,18 @@
 use std::{
-    ffi::CString, ops::{BitAnd, Shr}, os::fd::{AsRawFd, RawFd}
+    ffi::CString,
+    io::{
+        Error as IoErr,
+        ErrorKind::{InvalidData, UnexpectedEof, WouldBlock},
+        Result as IoResult,
+    },
+    ops::{BitAnd, Shr},
+    os::fd::{AsRawFd, RawFd},
 };
 
-use tokio::{io::{unix::AsyncFd, Interest}, sync::SemaphorePermit};
+use tokio::{
+    io::{unix::AsyncFd, Interest},
+    sync::SemaphorePermit,
+};
 
 // FT1.2 Protocol Constants
 const FT12_RESET_REQUEST: u8 = 0x10;
@@ -27,18 +37,15 @@ pub const KDRIVE_MAX_GROUP_VALUE_LEN: usize = 14;
 // FT1.2 Frame structure
 #[derive(Debug, Clone)]
 pub struct Ft12Frame {
-    pub control: u8,    // Control field
-    pub data: Vec<u8>,  // Data payload
+    pub control: u8,   // Control field
+    pub data: Vec<u8>, // Data payload
 }
 
 impl Ft12Frame {
-    fn new(control: u8, data: Vec<u8>) -> Self {        
-        Self {
-            control,
-            data,
-        }
+    fn new(control: u8, data: Vec<u8>) -> Self {
+        Self { control, data }
     }
-    
+
     fn calculate_checksum(control: u8, data: &[u8]) -> u8 {
         let mut sum = control as usize;
         for &byte in data {
@@ -46,11 +53,11 @@ impl Ft12Frame {
         }
         (sum & 0xFF) as u8
     }
-    
+
     fn to_bytes(&self) -> Vec<u8> {
         let length = (self.data.len() + 1) as u8; // +1 for control field
         let checksum = Self::calculate_checksum(self.control, &self.data);
-        let mut bytes = Vec::with_capacity(self.data.len()+7);
+        let mut bytes = Vec::with_capacity(self.data.len() + 7);
         bytes.push(FT12_FRAME_START);
         bytes.push(length);
         bytes.push(length);
@@ -61,104 +68,98 @@ impl Ft12Frame {
         bytes.push(FT12_FRAME_END);
         bytes
     }
-    
+
     fn from_bytes(bytes: &[u8]) -> Result<Self, KDriveErr> {
         if bytes.len() < 8 {
             return Err(KDriveErr::InvalidFrameLength); // Invalid frame length
         }
-        
+
         if bytes[0] != FT12_FRAME_START || bytes[3] != FT12_FRAME_START {
             return Err(KDriveErr::InvalidFrameStart); // Invalid frame start
         }
-        
+
         let length = bytes[1];
         if bytes[2] != length {
             return Err(KDriveErr::LengthMismatch); // Length mismatch
         }
-        
+
         if bytes.len() != (length as usize + 6) {
             return Err(KDriveErr::FrameLengthMismatch); // Frame length mismatch
         }
-        
+
         let control = bytes[4];
         let data_len = length as usize - 1;
-        let data = bytes[5..5+data_len].to_vec();
-        let checksum = bytes[5+data_len];
-        let end = bytes[5+data_len+1];
-        
+        let data = bytes[5..5 + data_len].to_vec();
+        let checksum = bytes[5 + data_len];
+        let end = bytes[5 + data_len + 1];
+
         if end != FT12_FRAME_END {
             return Err(KDriveErr::InvalidFrameEnd); // Invalid frame end
         }
-        
+
         let expected_checksum = Self::calculate_checksum(control, &data);
         if checksum != expected_checksum {
             return Err(KDriveErr::ChecksumMismatch); // Checksum mismatch
         }
-        
-        Ok(Self {
-            control,
-            data,
-        })
+
+        Ok(Self { control, data })
     }
 }
 
 struct TTYPort(AsyncFd<RawFd>);
 impl TTYPort {
-    pub async fn wait_readable(&self) -> std::io::Result<()> {
-        self.0.readable().await.map(|_|())
+    pub async fn wait_readable(&self) -> IoResult<()> {
+        self.0.readable().await.map(|_| ())
     }
-    pub fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.try_io(Interest::READABLE, |fd|Self::blocking_read(*fd, buf))
+    pub fn try_read(&self, buf: &mut [u8]) -> IoResult<usize> {
+        self.0
+            .try_io(Interest::READABLE, |fd| Self::blocking_read(*fd, buf))
     }
-    pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.async_io(Interest::READABLE, |fd|Self::blocking_read(*fd, buf)).await
+    pub async fn read(&self, buf: &mut [u8]) -> IoResult<usize> {
+        self.0
+            .async_io(Interest::READABLE, |fd| Self::blocking_read(*fd, buf))
+            .await
     }
-    fn blocking_read(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
-        let len = unsafe {
-            libc::read(fd, buf.as_mut_ptr().cast(), buf.len())
-        };
+    fn blocking_read(fd: i32, buf: &mut [u8]) -> IoResult<usize> {
+        let len = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
 
         if len >= 0 {
             //println!("read({:x?})", &buf[..len as usize]);
             Ok(len as usize)
-        }
-        else {
-            Err(std::io::Error::last_os_error())
+        } else {
+            Err(IoErr::last_os_error())
         }
     }
-    pub async fn read_exact(&self, buf: &mut [u8]) -> std::io::Result<()> {
+    pub async fn read_exact(&self, buf: &mut [u8]) -> IoResult<()> {
         let mut buf = buf;
         loop {
             let r = self.read(buf).await?;
             match r {
                 s if s == buf.len() => return Ok(()),
-                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-                p => buf = &mut buf[p..]
+                0 => return Err(UnexpectedEof.into()),
+                p => buf = &mut buf[p..],
             }
         }
     }
-    pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+    pub async fn write(&self, buf: &[u8]) -> IoResult<usize> {
         let a = self.0.writable().await?;
-        let len = unsafe {
-            libc::write(a.get_inner().as_raw_fd(), buf.as_ptr().cast(), buf.len())
-        };
+        let len = unsafe { libc::write(a.get_inner().as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
 
         if len >= 0 {
             //println!("write({:x?})", &buf[..len as usize]);
             Ok(len as usize)
-        }
-        else {
-            Err(std::io::Error::last_os_error())
+        } else {
+            Err(IoErr::last_os_error())
         }
     }
-    pub async fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
+    pub async fn write_all(&self, buf: &[u8]) -> IoResult<()> {
         let mut buf = buf;
         loop {
             let w = self.write(buf).await?;
             match w {
                 s if s == buf.len() => return Ok(()),
-                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-                p => buf = &buf[p..]
+                0 => return Err(UnexpectedEof.into()),
+                p => buf = &buf[p..],
             }
         }
     }
@@ -174,47 +175,66 @@ struct FT12Dev {
 }
 impl FT12Dev {
     /// open the serial device and set all the magic ioctrl
-    pub fn new(dev: &CString) -> std::io::Result<Self> {
+    pub fn new(dev: &CString) -> IoResult<Self> {
         // all flags are either from `stty -F /dev/ttyAMA0 -a` or from the strace also used for initialize_device
-        let fd = unsafe { libc::open(dev.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_LARGEFILE, 0) };
+        let fd = unsafe {
+            libc::open(
+                dev.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_LARGEFILE,
+                0,
+            )
+        };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(IoErr::last_os_error());
         }
         if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(IoErr::last_os_error());
         }
         let mut termios = termios::Termios::from_fd(fd)?;
         let o = termios::cfgetospeed(&termios);
         let i = termios::cfgetispeed(&termios);
         termios::tcflush(fd, termios::TCIFLUSH)?;
-        if o!=i || o != termios::B19200 {
+        if o != i || o != termios::B19200 {
             println!("baud rate aint cool: {} {}", o, i);
             termios::cfsetspeed(&mut termios, termios::B19200)?;
         }
         //set magic flags from strace
-        termios.c_iflag=0x14;
-        termios.c_oflag=0x4;
-        termios.c_cflag=0xdbe;
-        termios.c_lflag=0xa20;
-        termios.c_cc = [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        termios.c_iflag = 0x14;
+        termios.c_oflag = 0x4;
+        termios.c_cflag = 0xdbe;
+        termios.c_lflag = 0xa20;
+        termios.c_cc = [
+            3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
         //termios.c_cc[termios::VMIN]=1;
         //termios.c_cc[termios::VTIME]=0;
         termios::tcsetattr(fd, termios::TCSANOW, &termios)?;
         let port = TTYPort(AsyncFd::new(fd)?);
-        Ok(FT12Dev{d: port, s: tokio::sync::Semaphore::new(1), recv_odd: true.into(), send_odd: true.into()})
+        Ok(FT12Dev {
+            d: port,
+            s: tokio::sync::Semaphore::new(1),
+            recv_odd: true.into(),
+            send_odd: true.into(),
+        })
     }
-    pub async fn reset(&mut self) -> std::io::Result<()> {
+    pub async fn reset(&mut self) -> IoResult<()> {
         // Send reset request: 10 40 40 16
-        let reset_frame = [FT12_RESET_REQUEST, FT12_RESET_INDICATION, FT12_RESET_INDICATION, FT12_FRAME_END];
-        let sp =self.s.acquire().await.unwrap();
+        let reset_frame = [
+            FT12_RESET_REQUEST,
+            FT12_RESET_INDICATION,
+            FT12_RESET_INDICATION,
+            FT12_FRAME_END,
+        ];
+        let sp = self.s.acquire().await.unwrap();
         self.send_and_ack(&reset_frame, sp).await
     }
-    pub async fn write(&self, data: Vec<u8>) -> std::io::Result<()> {
-        let sp =self.s.acquire().await.unwrap();
+    pub async fn write(&self, data: Vec<u8>) -> IoResult<()> {
+        let sp = self.s.acquire().await.unwrap();
         let control = if unsafe { self.send_odd.get().read() } {
             unsafe { self.send_odd.get().write(false) };
             FT12_CTRL_HOST_ODD
-        }else{
+        } else {
             unsafe { self.send_odd.get().write(true) };
             FT12_CTRL_HOST_EVEN
         };
@@ -222,18 +242,21 @@ impl FT12Dev {
         self.send_and_ack(&frame.to_bytes(), sp).await
     }
     ///exclusively write and wait for an ack
-    async fn send_and_ack(&self, data: &[u8], sp: SemaphorePermit<'_>) -> std::io::Result<()> {     
+    async fn send_and_ack(&self, data: &[u8], sp: SemaphorePermit<'_>) -> IoResult<()> {
         self.d.write_all(data).await?;
 
         let mut ack_buf = [0u8; 1];
         self.d.read_exact(&mut ack_buf).await?;
         drop(sp);
         if ack_buf[0] != FT12_ACKNOWLEDGE {
-            return Err(std::io::ErrorKind::InvalidData.into()); // Wrong acknowledge
+            return Err(IoErr::new(
+                InvalidData,
+                format!("Wrong acknowledge 0x{:x}", ack_buf[0]),
+            ));
         }
         Ok(())
     }
-    /*pub async fn blocking_read(&self, buf: &mut [u8]) -> std::io::Result<Ft12Frame> {
+    /*pub async fn blocking_read(&self, buf: &mut [u8]) -> IoResult<Ft12Frame> {
         let sp =self.s.acquire().await.unwrap();
 
         println!("read lock");
@@ -242,16 +265,19 @@ impl FT12Dev {
     }*/
     /// wait for data to read
     /// only exclusively read (and ack) once the initial read was successful
-    pub async fn try_read(&self, buf: &mut [u8]) -> std::io::Result<Ft12Frame> {
+    pub async fn try_read(&self, buf: &mut [u8]) -> IoResult<Ft12Frame> {
         let (read, sp) = loop {
             self.d.wait_readable().await?;
             // there seems to be data - lock the bus and see if its true...
-            let sp =self.s.acquire().await.unwrap();
+            let sp = self.s.acquire().await.unwrap();
 
             //println!("read lock");
             match self.d.try_read(buf) {
                 //no data -> release and wait again
-                Err(e) if e.kind()==std::io::ErrorKind::WouldBlock => {drop(sp);continue},
+                Err(e) if e.kind() == WouldBlock => {
+                    drop(sp);
+                    continue;
+                }
                 Err(e) => return Err(e),
                 //data! - read the rest, only release after the ack
                 Ok(n) => break (n, sp),
@@ -262,117 +288,151 @@ impl FT12Dev {
         let expected_ctrl = if unsafe { self.recv_odd.get().read() } {
             unsafe { self.recv_odd.get().write(false) };
             FT12_CTRL_SRV_ODD
-        }else{
+        } else {
             unsafe { self.recv_odd.get().write(true) };
             FT12_CTRL_SRV_EVEN
         };
         if f.control != expected_ctrl {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "odd/even desync"));
+            return Err(IoErr::new(InvalidData, "odd/even desync"));
         }
         Ok(f)
     }
     /// read a frame from the bus and ack it. needs a locked bus
-    async fn internal_read(&self, mut read: usize, buf: &mut [u8], sp: SemaphorePermit<'_>) -> std::io::Result<Ft12Frame> {
+    async fn internal_read(
+        &self,
+        mut read: usize,
+        buf: &mut [u8],
+        sp: SemaphorePermit<'_>,
+    ) -> IoResult<Ft12Frame> {
         if read == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF reached"));
+            return Err(IoErr::new(UnexpectedEof, "EOF reached"));
         }
         // we should not pick up stray acks here, so it needs to be a frame start
         if buf[0] != FT12_FRAME_START {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Not a frame start"));
+            return Err(IoErr::new(
+                InvalidData,
+                format!("Not a frame start: {buf:x?}"),
+            ));
         }
         if read == 1 {
             //only frame start read, need to read length and rest
             self.d.read_exact(&mut buf[1..4]).await?;
             read = 4;
         }
-        let length = buf[1] as usize +6;    // length + 4 header bytes + checksum + end
+        let length = buf[1] as usize + 6; // length + 4 header bytes + checksum + end
         self.d.read_exact(&mut buf[read..length]).await?;
         //send ack
         self.d.write_all(&[FT12_ACKNOWLEDGE]).await?;
         drop(sp);
-        Ft12Frame::from_bytes(&buf[..length]).map_err(|e|std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        Ft12Frame::from_bytes(&buf[..length]).map_err(|e| IoErr::new(InvalidData, e))
     }
 }
 
 pub struct KDriveFT12(FT12Dev);
 
 impl KDriveFT12 {
-    pub async fn open(dev: &CString) -> std::io::Result<KDriveFT12> {        
+    pub async fn open(dev: &CString) -> IoResult<KDriveFT12> {
         let mut d = FT12Dev::new(dev)?;
         // Send reset request to initialize the connection
         d.reset().await?;
         let mut ft12 = KDriveFT12(d);
-        
+
         // Complete device initialization sequence
         ft12.initialize_device().await?;
-                
+
         Ok(ft12)
     }
-    
+
     /// Initialize the KNX device with the complete startup sequence.
-    /// 
+    ///
     /// This method replicates the initialization sequence observed in the tty_trace:
     /// 1. Initial configuration request
     /// 2. Multiple property read requests for device configuration
-    /// 
+    ///
     /// The sequence is based on a strace from the `libkdriveExpress.so` and establishes
     /// proper communication with the KNX interface before normal operation begins.
     /// `strace -o test -f -s 9999 -x -P /dev/ttyAMA0 -v ./baos_ctrl_d8c8b50dec17e6e52807fded3205aa366b779e0a`
-    async fn initialize_device(&mut self) -> std::io::Result<()> {
-        println!("Starting KNX device initialization...");            
+    async fn initialize_device(&mut self) -> IoResult<()> {
+        println!("Starting KNX device initialization...");
         // Step 1: Initial configuration request (line 12 in trace)
         // Request: \x68\x02\x02\x68\x73\xa7\x1a\x16
         // Expected response: \x68\x0c\x0c\x68\xf3\xa8\xff\xff\x00\xc5\x01\x03\xa2\xe2\x00\x04\xea\x16
         let init_frame = vec![0xa7];
         self.0.write(init_frame).await?;
-        self.expect_specific_response(&[0xa8, 0xff, 0xff, 0x00, 0xc5, 0x01, 0x03, 0xa2, 0xe2, 0x00, 0x04], "initial config").await?;
-        
+        self.expect_specific_response(
+            &[
+                0xa8, 0xff, 0xff, 0x00, 0xc5, 0x01, 0x03, 0xa2, 0xe2, 0x00, 0x04,
+            ],
+            "initial config",
+        )
+        .await?;
+
         // Step 2: Property read 1 (line 18)
         // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x40\x10\x01\xa9\x16
         // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x08\x01\x40\x10\x01\x00\x0b\x33\x16
         let prop1_frame = vec![0xfc, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01];
         self.0.write(prop1_frame).await?;
-        self.expect_specific_response(&[0xfb, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01, 0x00, 0x0b], "property read 1").await?;
-        
+        self.expect_specific_response(
+            &[0xfb, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01, 0x00, 0x0b],
+            "property read 1",
+        )
+        .await?;
+
         // Step 3: Property read 2 (line 23)
         // Request: \x68\x09\x09\x68\x73\xf6\x00\x08\x01\x34\x10\x01\x00\xb7\x16
         // Expected response: \x68\x08\x08\x68\xf3\xf5\x00\x08\x01\x34\x10\x01\x36\x16
         let prop2_frame = vec![0xf6, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00];
         self.0.write(prop2_frame).await?;
-        self.expect_specific_response(&[0xf5, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01], "property read 2").await?;
-        
+        self.expect_specific_response(
+            &[0xf5, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01],
+            "property read 2",
+        )
+        .await?;
+
         // Step 4: Property read 3 (line 28)
         // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x34\x10\x01\x9d\x16
         // Expected response: \x68\x09\x09\x68\xd3\xfb\x00\x08\x01\x34\x10\x01\x00\x1c\x16
         let prop3_frame = vec![0xfc, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01];
         self.0.write(prop3_frame).await?;
-        self.expect_specific_response(&[0xfb, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00], "property read 3").await?;
-        
+        self.expect_specific_response(
+            &[0xfb, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00],
+            "property read 3",
+        )
+        .await?;
+
         // Step 5: Property read 4 (line 33)
         // Request: \x68\x08\x08\x68\x73\xfc\x00\x08\x01\x33\x10\x01\xbc\x16
         // Expected response: \x68\x0a\x0a\x68\xf3\xfb\x00\x08\x01\x33\x10\x01\x00\x02\x3d\x16
         let prop4_frame = vec![0xfc, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01];
         self.0.write(prop4_frame).await?;
-        self.expect_specific_response(&[0xfb, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01, 0x00, 0x02], "property read 4").await?;
-        
+        self.expect_specific_response(
+            &[0xfb, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01, 0x00, 0x02],
+            "property read 4",
+        )
+        .await?;
+
         // Step 6: Property read 5 (line 38)
         // Request: \x68\x08\x08\x68\x53\xfc\x00\x00\x01\x38\x10\x01\x99\x16
         // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x00\x01\x38\x10\x01\x00\x37\x4f\x16
         let prop5_frame = vec![0xfc, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01];
         self.0.write(prop5_frame).await?;
-        self.expect_specific_response(&[0xfb, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01, 0x00, 0x37], "property read 5").await?;
-        
+        self.expect_specific_response(
+            &[0xfb, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01, 0x00, 0x37],
+            "property read 5",
+        )
+        .await?;
+
         println!("KNX device initialization completed successfully");
         Ok(())
     }
-    
+
     async fn expect_specific_response(
         &mut self,
-        expected_data: &[u8], 
-        step_name: &str
-    ) -> std::io::Result<()> {
+        expected_data: &[u8],
+        step_name: &str,
+    ) -> IoResult<()> {
         let mut temp_buf = [0u8; 512];
-        
+
         let frame = self.0.try_read(&mut temp_buf).await?;
         // Validate response data matches expected
         if frame.data == expected_data {
@@ -380,49 +440,51 @@ impl KDriveFT12 {
         } else {
             println!("Step '{}': Unexpected response data", step_name);
             println!("Expected: {:02x?}", &expected_data);
-            println!("Received: {:02x?}", &frame.data[..expected_data.len().min(frame.data.len())]);
-            Err(std::io::ErrorKind::InvalidData.into())// Unexpected response data
+            println!(
+                "Received: {:02x?}",
+                &frame.data[..expected_data.len().min(frame.data.len())]
+            );
+            Err(InvalidData.into()) // Unexpected response data
         }
     }
 
-    
-    pub async fn group_write(&self, addr: u16, data: &[u8]) -> std::io::Result<()> {
+    pub async fn group_write(&self, addr: u16, data: &[u8]) -> IoResult<()> {
         // Create cEMI frame for group write
         let cemi_frame = self.create_group_write_cemi(addr, data);
-                    
+
         // Send frame
         self.0.write(cemi_frame).await
     }
-    
+
     fn create_group_write_cemi(&self, addr: u16, data: &[u8]) -> Vec<u8> {
-        let mut cemi = Vec::with_capacity(data.len()+10);
-        
+        let mut cemi = Vec::with_capacity(data.len() + 10);
+
         // cEMI Message Code L_Data.req
         cemi.push(KDRIVE_CEMI_L_DATA_REQ);
-        
+
         // Additional Info Length (0 = no additional info)
         cemi.push(0x00);
-        
+
         // Control Field 1 (Standard frame, not repeated, broadcast, priority normal, no ack req)
         cemi.push(0xBC);
-        
+
         // Control Field 2 (Hop count 6, Extended frame format)
         cemi.push(0xE0);
-        
+
         // Source address (0x0000 = device address)
         cemi.push(0x00);
         cemi.push(0x00);
-        
+
         // Destination address (group address)
         cemi.push((addr >> 8) as u8);
         cemi.push((addr & 0xFF) as u8);
-        
+
         // TPCI (Transport layer) = 0x00, APCI (Application layer) = Group Value Write (0x80)
         // For 1-byte data, encode the data value in the lower 6 bits of APCI
         if data.len() == 1 {
             // Data length (NPDU + data)
             cemi.push(1);
-            
+
             let apci = 0x0080 | (data[0] as u16 & 0x003F);
             cemi.push((apci >> 8) as u8);
             cemi.push((apci & 0xFF) as u8);
@@ -436,17 +498,17 @@ impl KDriveFT12 {
             cemi.push(0x00); // TPCI
             cemi.push(0x80); // APCI Group Value Write
         }
-        
+
         // Additional data (if any)
         if data.len() > 1 {
             cemi.extend_from_slice(&data[1..]);
         }
-        
+
         cemi
     }
     ///Buffer will hold the whole cEMI data and an FT1.2 frame.
     /// returns a cEMI Message
-    pub async fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<Vec<u8>> {
+    pub async fn read_frame(&self, buf: &mut [u8]) -> IoResult<Vec<u8>> {
         Ok(self.0.try_read(buf).await?.data)
     }
 }
@@ -496,35 +558,35 @@ impl<'a> cEMIMsg<'a> {
             data: unsafe { std::slice::from_raw_parts(data, len as usize) },
         }
     }
-    
+
     pub fn from_bytes(data: &'a [u8]) -> cEMIMsg<'a> {
         cEMIMsg { data }
     }
-    
+
     pub fn get_msg_code(&self) -> u8 {
         self.data[0]
     }
-    
+
     pub fn is_group_write(&self) -> bool {
         if self.data.len() < 11 {
             return false;
         }
-        
+
         // Check APCI (Application Protocol Control Information) in bytes 9-10
         let apci = u16::from_be_bytes([self.data[9], self.data[10]])
             .shr(6u32)
             .bitand(0x0F);
-        
+
         apci == 2 // Group Value Write
     }
-    
+
     pub fn get_dest(&self) -> Result<u16, KDriveErr> {
         if self.data.len() < 8 {
             return Err(KDriveErr::CemiFrameTooShortForDestination);
         }
         Ok(u16::from_be_bytes([self.data[6], self.data[7]]))
     }
-    
+
     pub fn get_group_data<'b>(
         &self,
         msg: &'b mut [u8; KDRIVE_MAX_GROUP_VALUE_LEN],
@@ -532,31 +594,31 @@ impl<'a> cEMIMsg<'a> {
         if self.data.len() < 9 {
             return Err(KDriveErr::CemiFrameTooShortForDataLength);
         }
-        
+
         let len = self.data[8] as usize;
         if len == 0 {
             return Ok(&msg[..0]);
         }
-        
+
         let payload_start = 10;
         if self.data.len() < payload_start + len {
             return Err(KDriveErr::CemiFrameTruncated);
         }
-        
+
         let payload = &self.data[payload_start..payload_start + len];
-        
+
         // Copy payload to buffer
         if payload.len() > KDRIVE_MAX_GROUP_VALUE_LEN {
             return Err(KDriveErr::CemiDataTooLarge);
         }
-        
+
         msg[..payload.len()].copy_from_slice(payload);
-        
+
         // Mask the first byte to get only the data part (remove APCI bits)
         if !payload.is_empty() {
             msg[0] &= 0x3F;
         }
-        
+
         Ok(&msg[..len.saturating_sub(1).max(1)]) // Subtract 1 for APCI, but at least 1 byte
     }
 }
@@ -624,21 +686,29 @@ impl std::fmt::Display for KDriveErr {
             CemiFrameTruncated => "cEMI frame truncated",
             CemiDataTooLarge => "cEMI data too large",
             FailedToSendResponseAck => "Failed to send response acknowledgment",
-            TimeoutWaitingForInitializationResponse => "Timeout waiting for initialization response",
-            FailedToAcknowledgeDeviceReadyIndication => "Failed to acknowledge device ready indication",
+            TimeoutWaitingForInitializationResponse => {
+                "Timeout waiting for initialization response"
+            }
+            FailedToAcknowledgeDeviceReadyIndication => {
+                "Failed to acknowledge device ready indication"
+            }
             TimeoutWaitingForDeviceReadyIndication => "Timeout waiting for device ready indication",
             FailedToSendResponseAck2 => "Failed to send response acknowledgment",
-            UnexpectedResponseDataDuringInitialization => "Unexpected response data during initialization",
+            UnexpectedResponseDataDuringInitialization => {
+                "Unexpected response data during initialization"
+            }
             ReadErrorDuringResponseValidation => "Read error during response validation",
-            TimeoutWaitingForInitializationResponse2 => "Timeout waiting for initialization response",
+            TimeoutWaitingForInitializationResponse2 => {
+                "Timeout waiting for initialization response"
+            }
         };
         write!(f, "KDriveErr: {}", msg)
     }
 }
 impl std::error::Error for KDriveErr {}
 
-impl From<KDriveErr> for std::io::Error {
+impl From<KDriveErr> for IoErr {
     fn from(error: KDriveErr) -> Self {
-        std::io::Error::other(error)
+        IoErr::other(error)
     }
 }
