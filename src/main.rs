@@ -1,9 +1,13 @@
 use core::ptr::NonNull;
 use std::convert::TryInto;
+#[cfg(feature="mqtt")]
+use std::env;
 use std::ffi::CString;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
+#[cfg(feature="socket")]
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+#[cfg(feature="socket")]
 use tokio::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use tokio::sync::{
@@ -18,6 +22,8 @@ use ft12::{
 };
 mod types;
 use types::{Blind, Direction, Pos, Angle, ChannelMsg, StateStore, GroupWriter};
+#[cfg(feature="mqtt")]
+use rumqttc::{AsyncClient, MqttOptions, QoS};
 
 /// time a blind needs to go from top to bottom or visa verce
 const FULL_TRAVEL_TIME: Duration = Duration::from_millis(63_500);//57_600
@@ -33,6 +39,7 @@ fn main() {
 }
 
 async fn async_main() {
+    #[cfg(feature="socket")]
     let listener = TcpListener::bind("0.0.0.0:1337").await.expect("listen port");
 
     let serial = CString::new("/dev/ttyAMA0").unwrap();
@@ -40,22 +47,23 @@ async fn async_main() {
     let k1 = Rc::new(k);
     let k2 = k1.clone();
 
-    let (mut sender, receiver) = channel::<ChannelMsg>(32);
+    let (sender, bus_receiver) = channel::<ChannelMsg>(32);
 
     let states = Arc::new(Mutex::new(std::collections::HashMap::with_capacity(8)));
     //let mut states = rustc_hash::FxHashMap::with_capacity_and_hasher(8, Default::default());
     let state = Arc::clone(&states);
+    let state3 = Arc::clone(&states);
 
 
     let local = tokio::task::LocalSet::new();
     local.run_until(async move {
         // Spawn off an expensive computation
-        tokio::task::spawn_local(track_movements(receiver, states));
+        #[cfg(not(feature="mqtt"))]
+        tokio::task::spawn_local(track_movements(bus_receiver, states));
         
         tokio::task::spawn_local(async move {
-            let mut buf = [0u8;512];
+            let mut buf = [0u8;32];
             loop {
-                println!("w4b");
                 let r = {
                     k2.read_frame(&mut buf).await
                 };
@@ -66,31 +74,116 @@ async fn async_main() {
                         return;
                     }
                 };
-                on_telegram(cEMIMsg::from_bytes(&cemi), NonNull::new(&mut sender as *mut _)).await
+                on_telegram(cEMIMsg::from_bytes(&cemi), &sender).await
             }
         });
-        let (sender, mut receiver) = channel::<(u16, Direction)>(8);
+        let (bus_sender, mut receiver) = channel::<(u16, Direction)>(8);
         tokio::task::spawn_local(async move {
             while let Some((addr, d1)) = receiver.recv().await {
                 k1.group_write(addr, &[d1 as u8]).await.expect("write err");
             }
         });
+        let bus_sender2 = bus_sender.clone();
+        #[cfg(feature="socket")]
+        tokio::task::spawn_local(async move {
+            let mut buf = [0u8; 5];
+            loop {
+                let stream = listener.accept().await.map(|(s, _)|s);
+                if let Err(e) = handle_connection(stream, &mut buf, &bus_sender, &state).await {
+                    println!("handle_connection failed {}", e);
+                }
+            }
+        });
 
-        let mut buf = [0u8; 5];
-        loop {
-            let stream = listener.accept().await.map(|(s, _)|s);
-            if let Err(e) = handle_connection(stream, &mut buf, &sender, &state).await {
-                println!("handle_connection failed {}", e);
+        #[cfg(feature="mqtt")]
+        {
+            let mut mqttoptions = MqttOptions::new("rumqtt-sync", "192.168.178.25", 1883);
+            mqttoptions.set_credentials(env::var("HA_MQTT_USER").expect("no mqtt user"), env::var("HA_MQTT_PASS").expect("no mqtt password"));
+            mqttoptions.set_keep_alive(Duration::from_secs(5));
+
+            let (client, mut connection) = AsyncClient::new(mqttoptions, 32);
+            for c in b'a'..=b'h' {
+                client.subscribe(format!("cover/{}/set", c as char), QoS::AtMostOnce).await.expect("sub set");
+                client.subscribe(format!("cover/{}/tilt", c as char), QoS::AtMostOnce).await.expect("sub tilt");
+            }
+            client.publish("cover/availability", QoS::AtLeastOnce, true, "online").await.expect("avail");
+
+            tokio::task::spawn_local(track_movements(bus_receiver, states, client));
+
+            loop {
+                match connection.poll().await {
+                    Ok(notification) =>{
+                        //println!("Notification = {:?}", notification);
+                        if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish)) = notification {
+                            if let Some(s) = publish.topic.strip_prefix("cover/") {
+                                if let Some(id) = s.strip_suffix("/set") {
+                                    println!("move {} to {:?}", id, publish.payload);//payload is STOP CLOSE ...
+                                    if let Some(b) = blind_from_str(id){
+                                        mqtt_set(b, &publish.payload, &bus_sender2).await
+                                    }
+                                }
+                                if let Some(id) = s.strip_suffix("/tilt") {
+                                    println!("tilt {} to {:?}", id, publish.payload);//payload is 0-7 STOP
+                                    if let Some(b) = blind_from_str(id){
+                                        mqtt_tilt(b, &publish.payload, &bus_sender2, &state3).await
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        connection.clean();
+                        eprintln!("MQTT Error: {}", e);
+                        break;
+                    }
+                }
             }
         }
     }).await;
 }
+#[cfg(feature="mqtt")]
+fn blind_from_str(id: &str) -> Option<Blind> {
+    let id = *id.as_bytes().first()?;
+    if id > b'h' {
+        return None;
+    }
+    Some(Blind::from_port(id))
+}
+#[cfg(feature="mqtt")]
+async fn mqtt_set(b: Blind, cmd: &[u8], sender: &GroupWriter) {
+    match cmd {
+        b"OPEN" => {sender.send((b.to_bus_addr(false), Direction::Up)).await.expect("msg")},
+        b"CLOSE" => {sender.send((b.to_bus_addr(false), Direction::Down)).await.expect("msg")},
+        b"STOP" => {sender.send((b.to_bus_addr(true), Direction::Up)).await.expect("msg")},
+        _ => return
+    }
+}
+#[cfg(feature="mqtt")]
+async fn mqtt_tilt(b: Blind, cmd: &[u8], sender: &GroupWriter, state: &Arc<Mutex<StateStore>>) {
+    if cmd == b"STOP" {return}
+    if cmd.len() != 1 {return}
+    let a = cmd[0] - b'0';
+    if a > 7 {return}
+    let Some(p) = state.lock().await.get(&b).map(|(_, _, p, _)|*p) else{
+        return;
+    };
+    
+    move_to_pos(
+        b,
+        p.into(),
+        a,
+        sender,
+        state
+    ).await.expect("nope")
+}
+
+#[cfg(any(feature="mqtt",feature="socket"))]
 async fn move_to_pos(
     id: Blind,
     target_p: u8,
     target_a: u8,
-    k: GroupWriter,
-    state: Arc<Mutex<StateStore>>,
+    k: &GroupWriter,
+    state: &Arc<Mutex<StateStore>>,
 ) -> std::io::Result<()> {
     //get curr pos
     let a = state.lock().await.get(&id).map(|(_, _, p, a)|(*p, *a));
@@ -148,6 +241,7 @@ async fn move_to_pos(
     k.send((id.to_bus_addr(true), dir)).await.expect("send err");
     Ok(())
 }
+#[cfg(feature="socket")]
 async fn handle_connection(
     stream: std::io::Result<TcpStream>,
     buf: &mut [u8],
@@ -195,7 +289,10 @@ async fn handle_connection(
         Some(&[pos, ang]) if pos & 0x80 == 0x80 => {
             for addr in TargetIter::new(target)? {
                 let k = k.clone();
-                tokio::spawn(move_to_pos(addr, pos & 0x7f, ang, k, state.clone()));
+                let state = state.clone();
+                tokio::spawn(async move {
+                    move_to_pos(addr, pos & 0x7f, ang, &k, &state).await
+                });
             }
             return Ok(());
         }
@@ -257,7 +354,7 @@ fn get_addr(c: &[u8]) -> std::io::Result<Blind> {
 }
 async fn on_telegram(
     data: cEMIMsg<'_>,
-    user_data: Option<NonNull<Sender<ChannelMsg>>>,
+    user_data: &Sender<ChannelMsg>,
 ) {
     let mut msg = [0; KDRIVE_MAX_GROUP_VALUE_LEN];
 
@@ -270,13 +367,11 @@ async fn on_telegram(
                         if msg != [0] {
                             println!("Group Write: 1 {:?}", msg);
                             //set all to UP
-                            if let Some(mut sender) = user_data {
-                                if unsafe { sender.as_mut() }
-                                    .send((Instant::now(), Direction::Up, false, Blind::wind())).await
-                                    .is_err()
-                                {
-                                    println!("send failed (wind)")
-                                }
+                            if user_data.send((Instant::now(), Direction::Up, false, Blind::wind()))
+                            .await
+                            .is_err()
+                            {
+                                println!("send failed (wind)")
                             }
                         }
                         return;
@@ -288,9 +383,7 @@ async fn on_telegram(
                     addr if addr & 0xFE00 == 0x1000 => {
                         if msg.len() == 1 {
                             //keep track of own IDs
-                            if let Some(mut sender) = user_data {
-                                track_write(addr, msg[0], unsafe { sender.as_mut() }).await;
-                            }
+                            track_write(addr, msg[0], user_data).await;
                             //[29, 0, bc, e0, 12, 12, 11, 32, 1, 0, 80]
                             // KDRIVE_CEMI_L_DATA_IND
                             //        xx  xx - ctrl
@@ -314,13 +407,11 @@ async fn on_telegram(
             // 0x10 | 0x11
             if data[10] & 0x80 != 0 {
                 // 0x80 | 0x81
-                if let Some(mut sender) = user_data {
-                    track_write(
-                        u16::from_be_bytes(data[6..8].try_into().unwrap()),
-                        data[10] & 0x7F,
-                        unsafe { sender.as_mut() },
-                    ).await;
-                }
+                track_write(
+                    u16::from_be_bytes(data[6..8].try_into().unwrap()),
+                    data[10] & 0x7F,
+                    user_data,
+                ).await;
                 return;
             }
         }
@@ -330,7 +421,7 @@ async fn on_telegram(
 
 //heliocron::calc::SolarCalculations
 
-async fn track_write(addr: u16, val: u8, sender: &mut Sender<ChannelMsg>) {
+async fn track_write(addr: u16, val: u8, sender: &Sender<ChannelMsg>) {
     let (_lower, upper) = match Blind::from_bus_addr(addr) {
         Ok((r, single_step)) => {
             println!("Bus: 0x{:x} {}", addr, val);
@@ -425,7 +516,7 @@ fn track_single_press(
     }
 }
 
-async fn track_movements(mut receiver: Receiver<ChannelMsg>, states: Arc<Mutex<StateStore>>) {
+async fn track_movements(mut receiver: Receiver<ChannelMsg>, states: Arc<Mutex<StateStore>>, #[cfg(feature="mqtt")] client: AsyncClient) {
     loop {
         match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
             Ok(None) => return,
@@ -438,6 +529,9 @@ async fn track_movements(mut receiver: Receiver<ChannelMsg>, states: Arc<Mutex<S
                     id,
                     &mut ss,
                 );
+                drop(ss);
+                #[cfg(feature="mqtt")]
+                report(id, &states, &client).await;
                 /*println!("states:");
                 let s = states.lock().expect("poised");
                 for (&k, (_i, _u, p, a)) in s.iter() {
@@ -448,19 +542,52 @@ async fn track_movements(mut receiver: Receiver<ChannelMsg>, states: Arc<Mutex<S
                 //clean up status -> look for full moves
                 for k in b'a'..=b'h' {
                     let id = Blind::from_port(k);
+                    let mut ss = states.lock().await;
                     if let Some((ref mut time, ref mut moves_up, ref mut pos, ref mut ang)) =
-                        states.lock().await.get_mut(&id)
+                        ss.get_mut(&id)
                     {
                         if let Some(t) = time {
                             if t.elapsed() >= FULL_TRAVEL_TIME {
                                 *time = None;
                                 full_move(id, *moves_up, pos, ang);
+                                drop(ss);
+                                #[cfg(feature="mqtt")]
+                                report(id, &states, &client).await;
                             }
                         }
                     }
                 }
             }
         }
+    }
+}
+#[cfg(feature="mqtt")]
+async fn report(id: Blind, state: &Mutex<StateStore>, client: &AsyncClient) {
+    //cover/a..h/state position availability tilt-state
+
+    //query data
+    let s = state.lock().await;
+    if let Some((t, up, position, tilt)) = s.get(&id) {
+        let pos = (*position).into();
+        let state = if t.is_some() {
+            //its currently moving
+            match up {
+                Direction::Up => "opening",
+                Direction::Down => "closing",
+            }
+        }else{
+            match pos {
+                100u8 => "open",
+                0u8 => "closed",
+                _ => "stopped"
+            }
+        };
+        let tilt: u8 = (*tilt).into();
+        client.publish(format!("cover/{}/position", id.letter()), QoS::AtLeastOnce, true, format!("{}", pos)).await.unwrap();
+        client.publish(format!("cover/{}/tilt-state", id.letter()), QoS::AtLeastOnce, true, format!("{}", tilt)).await.unwrap();
+        client.publish(format!("cover/{}/state", id.letter()), QoS::AtLeastOnce, true, state).await.unwrap();
+    } else {
+        client.publish(format!("cover/{}/state", id.letter()), QoS::AtLeastOnce, true, "None").await.unwrap();
     }
 }
 fn shortened_move(id: Blind, time_moving: Duration, moves_up: Direction, pos: &mut Pos, ang: &mut Angle) {

@@ -1,5 +1,5 @@
 use std::fmt::Debug;
-use std::sync::mpsc::Sender;
+use tokio::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 ///time, up, single step, ID
@@ -14,7 +14,7 @@ pub enum Direction {
     Up = 0,
     Down = 1
 }
-
+/// buss address of a blind
 #[repr(transparent)]
 #[derive(Eq, PartialEq, Hash, Clone, Copy)]
 pub struct Blind(u8);
@@ -48,6 +48,10 @@ impl Blind {
         }else{
             Self::CMD_FULL_MOVE + self.0 as u16
         }
+    }
+    #[inline]
+    pub fn letter(self) -> char {
+        (self.0 - Self::BUS_START_ADDR + b'a') as char
     }
     //special id for wind indicator
     pub fn wind() -> Blind {

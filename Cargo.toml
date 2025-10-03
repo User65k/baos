@@ -7,9 +7,12 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 # Pure Rust implementation - no feature flags needed
 [features]
+mqtt = ["dep:rumqttc"]
+socket = []
+default = ["mqtt", "socket"]
 
 [dependencies]
-rumqttc = {version = "0.25", default-features = false}
+rumqttc = {version = "0.25", default-features = false, optional = true}
 tokio = {version = "1", features = ["rt", "net", "sync", "time"]}
 libc = "0.2"
 termios = "0.3"

@@ -1,4 +1,3 @@
-use core::ptr::NonNull;
 use std::{
     ffi::CString, ops::{BitAnd, Shr}, os::fd::{AsRawFd, RawFd}
 };
@@ -120,7 +119,7 @@ impl TTYPort {
         };
 
         if len >= 0 {
-            println!("read({:x?})", &buf[..len as usize]);
+            //println!("read({:x?})", &buf[..len as usize]);
             Ok(len as usize)
         }
         else {
@@ -145,7 +144,7 @@ impl TTYPort {
         };
 
         if len >= 0 {
-            println!("write({:x?})", &buf[..len as usize]);
+            //println!("write({:x?})", &buf[..len as usize]);
             Ok(len as usize)
         }
         else {
@@ -174,7 +173,9 @@ struct FT12Dev {
     send_odd: std::cell::UnsafeCell<bool>,
 }
 impl FT12Dev {
+    /// open the serial device and set all the magic ioctrl
     pub fn new(dev: &CString) -> std::io::Result<Self> {
+        // all flags are either from `stty -F /dev/ttyAMA0 -a` or from the strace also used for initialize_device
         let fd = unsafe { libc::open(dev.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_LARGEFILE, 0) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
@@ -247,7 +248,7 @@ impl FT12Dev {
             // there seems to be data - lock the bus and see if its true...
             let sp =self.s.acquire().await.unwrap();
 
-            println!("read lock");
+            //println!("read lock");
             match self.d.try_read(buf) {
                 //no data -> release and wait again
                 Err(e) if e.kind()==std::io::ErrorKind::WouldBlock => {drop(sp);continue},
@@ -314,8 +315,9 @@ impl KDriveFT12 {
     /// 1. Initial configuration request
     /// 2. Multiple property read requests for device configuration
     /// 
-    /// The sequence is based on lines 12-46 from the trace file and establishes
+    /// The sequence is based on a strace from the `libkdriveExpress.so` and establishes
     /// proper communication with the KNX interface before normal operation begins.
+    /// `strace -o test -f -s 9999 -x -P /dev/ttyAMA0 -v ./baos_ctrl_d8c8b50dec17e6e52807fded3205aa366b779e0a`
     async fn initialize_device(&mut self) -> std::io::Result<()> {
         println!("Starting KNX device initialization...");            
         // Step 1: Initial configuration request (line 12 in trace)
@@ -442,7 +444,8 @@ impl KDriveFT12 {
         
         cemi
     }
-    ///returns a cEMI Message
+    ///Buffer will hold the whole cEMI data and an FT1.2 frame.
+    /// returns a cEMI Message
     pub async fn read_frame(&self, buf: &mut [u8]) -> std::io::Result<Vec<u8>> {
         Ok(self.0.try_read(buf).await?.data)
     }
