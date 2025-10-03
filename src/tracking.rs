@@ -1,5 +1,5 @@
 use crate::{
-    ft12::{cEMIMsg, KDRIVE_CEMI_L_DATA_IND, KDRIVE_MAX_GROUP_VALUE_LEN},
+    ft12::{cEMIMsg, MessageCode, KDRIVE_MAX_GROUP_VALUE_LEN},
     types::{Angle, Blind, ChannelMsg, Direction, Pos, StateStore},
     FULL_TRAVEL_TIME,
 };
@@ -17,67 +17,69 @@ use tokio::sync::{
 pub async fn on_telegram(data: cEMIMsg<'_>, user_data: &Sender<ChannelMsg>) {
     let mut msg = [0; KDRIVE_MAX_GROUP_VALUE_LEN];
 
-    if KDRIVE_CEMI_L_DATA_IND == data.get_msg_code() && data.is_group_write() {
+    if data.is_group_write() {
         if let Ok(addr) = data.get_dest() {
             if let Ok(msg) = data.get_group_data(&mut msg) {
-                match addr {
-                    1 => {
-                        //zero  1: alles hoch / 0: alles cool
-                        if msg != [0] {
-                            println!("Group Write: 1 {:?}", msg);
-                            //set all to UP
-                            if user_data
-                                .send((Instant::now(), Direction::Up, false, Blind::wind()))
-                                .await
-                                .is_err()
-                            {
-                                println!("send failed (wind)")
+                match data.get_msg_code() {
+                    MessageCode::LDataInd => {
+                        // data from the bus
+                        match addr {
+                            1 => {
+                                //zero  1: alles hoch / 0: alles cool
+                                if msg != [0] {
+                                    println!("Group Write: 1 {:?}", msg);
+                                    //set all to UP
+                                    if user_data
+                                        .send((Instant::now(), Direction::Up, false, Blind::wind()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        println!("send failed (wind)")
+                                    }
+                                }
+                                return;
                             }
+                            2 => {
+                                //wind - no longer avail
+                                println!("Wind: {}", u16::from_be_bytes(msg[..2].try_into().unwrap()));
+                            }
+                            addr if addr & 0xFE00 == 0x1000 => {
+                                if msg.len() == 1 {
+                                    //keep track of own IDs
+                                    track_write(addr, msg[0], user_data).await;
+                                    //[29, 0, bc, e0, 12, 12, 11, 32, 1, 0, 80]
+                                    // KDRIVE_CEMI_L_DATA_IND
+                                    //        xx  xx - ctrl
+                                    //                xx  xx - src
+                                    //                        xx  xx - dst
+                                    //                                len
+                                    //
+                                    return;
+                                }
+                            }
+                            _ => {}
                         }
+                        println!("Group Write: 0x{:x} {:?}", addr, msg);
                         return;
-                    }
-                    2 => {
-                        //wind - no longer avail
-                        println!("Wind: {}", u16::from_be_bytes(msg[..2].try_into().unwrap()));
-                    }
-                    addr if addr & 0xFE00 == 0x1000 => {
-                        if msg.len() == 1 {
-                            //keep track of own IDs
-                            track_write(addr, msg[0], user_data).await;
-                            //[29, 0, bc, e0, 12, 12, 11, 32, 1, 0, 80]
-                            // KDRIVE_CEMI_L_DATA_IND
-                            //        xx  xx - ctrl
-                            //                xx  xx - src
-                            //                        xx  xx - dst
-                            //                                len
-                            //
+                    },
+                    MessageCode::LDataCon => {
+                        // initiated by our group_write
+                        if addr & 0xFE00 == 0x1000 && msg.len() == 1 {
+                            track_write(
+                                addr,
+                                msg[0],
+                                user_data,
+                            )
+                            .await;
                             return;
                         }
                     }
                     _ => {}
                 }
-                println!("Group Write: 0x{:x} {:?}", addr, msg);
-                return;
             }
         }
     }
-    if data[..6] == [46, 0, 188, 224, 255, 255] && data[8..10] == [1, 0] {
-        //initiated by our group_write
-        if data[6] & 0x10 != 0 {
-            // 0x10 | 0x11
-            if data[10] & 0x80 != 0 {
-                // 0x80 | 0x81
-                track_write(
-                    u16::from_be_bytes(data[6..8].try_into().unwrap()),
-                    data[10] & 0x7F,
-                    user_data,
-                )
-                .await;
-                return;
-            }
-        }
-    }
-    //println!("Data: {:?}", data);
+    println!("Bus Data: {:?}", data.as_ref());
 }
 /// further process an incoming message
 /// sends it over a channel to `track_movements`

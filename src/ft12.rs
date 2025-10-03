@@ -11,7 +11,7 @@ use std::{
 
 use tokio::{
     io::{unix::AsyncFd, Interest},
-    sync::SemaphorePermit,
+    sync::SemaphorePermit, task::yield_now,
 };
 
 // FT1.2 Protocol Constants
@@ -27,11 +27,37 @@ const FT12_ACKNOWLEDGE: u8 = 0xE5;
 const FT12_FRAME_START: u8 = 0x68;
 const FT12_FRAME_END: u8 = 0x16;
 
-// Service codes
-///cEMI message code for L_Data.ind
-pub const KDRIVE_CEMI_L_DATA_IND: u8 = 0x29;
-/// cEMI Message Code for L_Data.req
-pub const KDRIVE_CEMI_L_DATA_REQ: u8 = 0x11;
+/// Service codes
+/// https://knx.readthedocs.io/en/latest/knx__types_8h_source.html#l00038
+#[derive(PartialEq)]
+#[repr(u8)]
+pub enum MessageCode
+{
+    // L_Data services
+    LDataReq = 0x11,
+    LDataCon = 0x2E,
+    LDataInd = 0x29,
+
+    // Data Properties
+    MPropReadReq = 0xFC,
+    MPropReadCon = 0xFB,
+    MPropWriteReq = 0xF6,
+    MPropWriteCon = 0xF5,
+    MPropInfoInd = 0xF7,
+
+    // Function Properties
+    MFuncPropCommandReq = 0xF8,
+    MFuncPropCommandCon = 0xFA,
+    MFuncPropStateReadReq = 0xF9,
+    //M_FuncPropStateRead_con = 0xFA, // same as M_FuncPropStateRead_con (see 3/6/3 p.105)
+
+    // Further cEMI servies
+    MResetReq = 0xF1,
+    MResetInd = 0xF0,
+
+    DontKnow = 0
+}
+
 pub const KDRIVE_MAX_GROUP_VALUE_LEN: usize = 14;
 
 // FT1.2 Frame structure
@@ -45,7 +71,7 @@ impl Ft12Frame {
     fn new(control: u8, data: Vec<u8>) -> Self {
         Self { control, data }
     }
-
+    //the FT1.2 checksum is the LSB of sum of bytes
     fn calculate_checksum(control: u8, data: &[u8]) -> u8 {
         let mut sum = control as usize;
         for &byte in data {
@@ -141,7 +167,7 @@ impl TTYPort {
             }
         }
     }
-    pub async fn write(&self, buf: &[u8]) -> IoResult<usize> {
+    async fn write(&self, buf: &[u8]) -> IoResult<usize> {
         let a = self.0.writable().await?;
         let len = unsafe { libc::write(a.get_inner().as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
 
@@ -172,6 +198,7 @@ struct FT12Dev {
     recv_odd: std::cell::UnsafeCell<bool>,
     /// protected by semaphore
     send_odd: std::cell::UnsafeCell<bool>,
+    fast_read: tokio::sync::Mutex<Vec<Ft12Frame>>
 }
 impl FT12Dev {
     /// open the serial device and set all the magic ioctrl
@@ -216,6 +243,7 @@ impl FT12Dev {
             s: tokio::sync::Semaphore::new(1),
             recv_odd: true.into(),
             send_odd: true.into(),
+            fast_read: tokio::sync::Mutex::new(Vec::with_capacity(2))
         })
     }
     pub async fn reset(&mut self) -> IoResult<()> {
@@ -242,18 +270,28 @@ impl FT12Dev {
         self.send_and_ack(&frame.to_bytes(), sp).await
     }
     ///exclusively write and wait for an ack
-    async fn send_and_ack(&self, data: &[u8], sp: SemaphorePermit<'_>) -> IoResult<()> {
+    async fn send_and_ack(&self, data: &[u8], mut sp: SemaphorePermit<'_>) -> IoResult<()> {
         self.d.write_all(data).await?;
-
-        let mut ack_buf = [0u8; 1];
-        self.d.read_exact(&mut ack_buf).await?;
-        drop(sp);
-        if ack_buf[0] != FT12_ACKNOWLEDGE {
-            return Err(IoErr::new(
-                InvalidData,
-                format!("Wrong acknowledge 0x{:x}", ack_buf[0]),
-            ));
+        loop{
+            let mut ack_buf = [0u8; 1];
+            self.d.read_exact(&mut ack_buf).await?;
+            match ack_buf[0] {
+                FT12_ACKNOWLEDGE => break,
+                FT12_FRAME_START => {
+                    let mut buf = [0u8;32];
+                    buf[0] = FT12_FRAME_START;
+                    let np = sp.split(0).unwrap();
+                    self.fast_read.lock().await.push(self.internal_read(1, &mut buf, np).await?);
+                    continue;
+                },
+                _ => return Err(IoErr::new(
+                    InvalidData,
+                    format!("Wrong acknowledge 0x{:x}", ack_buf[0]),
+                )),
+            }
         }
+        drop(sp);
+        yield_now().await;
         Ok(())
     }
     /*pub async fn blocking_read(&self, buf: &mut [u8]) -> IoResult<Ft12Frame> {
@@ -266,35 +304,38 @@ impl FT12Dev {
     /// wait for data to read
     /// only exclusively read (and ack) once the initial read was successful
     pub async fn try_read(&self, buf: &mut [u8]) -> IoResult<Ft12Frame> {
-        let (read, sp) = loop {
-            self.d.wait_readable().await?;
-            // there seems to be data - lock the bus and see if its true...
-            let sp = self.s.acquire().await.unwrap();
 
-            //println!("read lock");
-            match self.d.try_read(buf) {
-                //no data -> release and wait again
-                Err(e) if e.kind() == WouldBlock => {
-                    drop(sp);
-                    continue;
+        let mut v = self.fast_read.lock().await;
+        let buffered = if v.is_empty() {
+            None
+        }else{
+            println!("{} behind", v.len());
+            Some(v.remove(0))
+        };
+        drop(v);
+        let f = if let Some(a) = buffered {
+            a
+        }else{
+            let (read, sp) = loop {
+                self.d.wait_readable().await?;
+                // there seems to be data - lock the bus and see if its true...
+                let sp = self.s.acquire().await.unwrap();
+
+                //println!("read lock");
+                match self.d.try_read(buf) {
+                    //no data -> release and wait again
+                    Err(e) if e.kind() == WouldBlock => {
+                        drop(sp);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                    //data! - read the rest, only release after the ack
+                    Ok(n) => break (n, sp),
                 }
-                Err(e) => return Err(e),
-                //data! - read the rest, only release after the ack
-                Ok(n) => break (n, sp),
-            }
+            };
+            let f = self.internal_read(read, buf, sp).await?;
+            f
         };
-        let f = self.internal_read(read, buf, sp).await?;
-
-        let expected_ctrl = if unsafe { self.recv_odd.get().read() } {
-            unsafe { self.recv_odd.get().write(false) };
-            FT12_CTRL_SRV_ODD
-        } else {
-            unsafe { self.recv_odd.get().write(true) };
-            FT12_CTRL_SRV_EVEN
-        };
-        if f.control != expected_ctrl {
-            return Err(IoErr::new(InvalidData, "odd/even desync"));
-        }
         Ok(f)
     }
     /// read a frame from the bus and ack it. needs a locked bus
@@ -321,10 +362,22 @@ impl FT12Dev {
         }
         let length = buf[1] as usize + 6; // length + 4 header bytes + checksum + end
         self.d.read_exact(&mut buf[read..length]).await?;
+        let f= Ft12Frame::from_bytes(&buf[..length]).map_err(|e| IoErr::new(InvalidData, e))?;
+        //println!("read {f:?}");
+        let expected_ctrl = if unsafe { self.recv_odd.get().read() } {
+            unsafe { self.recv_odd.get().write(false) };
+            FT12_CTRL_SRV_ODD
+        } else {
+            unsafe { self.recv_odd.get().write(true) };
+            FT12_CTRL_SRV_EVEN
+        };
+        if f.control != expected_ctrl {
+            return Err(IoErr::new(InvalidData, "odd/even desync"));
+        }
         //send ack
         self.d.write_all(&[FT12_ACKNOWLEDGE]).await?;
         drop(sp);
-        Ft12Frame::from_bytes(&buf[..length]).map_err(|e| IoErr::new(InvalidData, e))
+        Ok(f)
     }
 }
 
@@ -363,17 +416,17 @@ impl KDriveFT12 {
             &[
                 0xa8, 0xff, 0xff, 0x00, 0xc5, 0x01, 0x03, 0xa2, 0xe2, 0x00, 0x04,
             ],
-            "initial config",
+            "EIB message code a7",
         )
         .await?;
 
         // Step 2: Property read 1 (line 18)
         // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x40\x10\x01\xa9\x16
         // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x08\x01\x40\x10\x01\x00\x0b\x33\x16
-        let prop1_frame = vec![0xfc, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01];
+        let prop1_frame = vec![MessageCode::MPropReadReq as u8, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01];
         self.0.write(prop1_frame).await?;
         self.expect_specific_response(
-            &[0xfb, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01, 0x00, 0x0b],
+            &[MessageCode::MPropReadCon as u8, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01, 0x00, 0x0b],
             "property read 1",
         )
         .await?;
@@ -381,44 +434,44 @@ impl KDriveFT12 {
         // Step 3: Property read 2 (line 23)
         // Request: \x68\x09\x09\x68\x73\xf6\x00\x08\x01\x34\x10\x01\x00\xb7\x16
         // Expected response: \x68\x08\x08\x68\xf3\xf5\x00\x08\x01\x34\x10\x01\x36\x16
-        let prop2_frame = vec![0xf6, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00];
+        let prop2_frame = vec![MessageCode::MPropWriteReq as u8, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00];
         self.0.write(prop2_frame).await?;
         self.expect_specific_response(
-            &[0xf5, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01],
-            "property read 2",
+            &[MessageCode::MPropWriteCon as u8, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01],
+            "property write",
         )
         .await?;
 
         // Step 4: Property read 3 (line 28)
         // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x34\x10\x01\x9d\x16
         // Expected response: \x68\x09\x09\x68\xd3\xfb\x00\x08\x01\x34\x10\x01\x00\x1c\x16
-        let prop3_frame = vec![0xfc, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01];
+        let prop3_frame = vec![MessageCode::MPropReadReq as u8, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01];
         self.0.write(prop3_frame).await?;
         self.expect_specific_response(
-            &[0xfb, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00],
-            "property read 3",
+            &[MessageCode::MPropReadCon as u8, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00],
+            "property read 2",
         )
         .await?;
 
         // Step 5: Property read 4 (line 33)
         // Request: \x68\x08\x08\x68\x73\xfc\x00\x08\x01\x33\x10\x01\xbc\x16
         // Expected response: \x68\x0a\x0a\x68\xf3\xfb\x00\x08\x01\x33\x10\x01\x00\x02\x3d\x16
-        let prop4_frame = vec![0xfc, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01];
+        let prop4_frame = vec![MessageCode::MPropReadReq as u8, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01];
         self.0.write(prop4_frame).await?;
         self.expect_specific_response(
-            &[0xfb, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01, 0x00, 0x02],
-            "property read 4",
+            &[MessageCode::MPropReadCon as u8, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01, 0x00, 0x02],
+            "property read 3",
         )
         .await?;
 
         // Step 6: Property read 5 (line 38)
         // Request: \x68\x08\x08\x68\x53\xfc\x00\x00\x01\x38\x10\x01\x99\x16
         // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x00\x01\x38\x10\x01\x00\x37\x4f\x16
-        let prop5_frame = vec![0xfc, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01];
+        let prop5_frame = vec![MessageCode::MPropReadReq as u8, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01];
         self.0.write(prop5_frame).await?;
         self.expect_specific_response(
-            &[0xfb, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01, 0x00, 0x37],
-            "property read 5",
+            &[MessageCode::MPropReadCon as u8, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01, 0x00, 0x37],
+            "property read 4",
         )
         .await?;
 
@@ -455,21 +508,47 @@ impl KDriveFT12 {
         // Send frame
         self.0.write(cemi_frame).await
     }
-
+    //https://knx.readthedocs.io/en/latest/cemi__frame_8cpp_source.html
     fn create_group_write_cemi(&self, addr: u16, data: &[u8]) -> Vec<u8> {
         let mut cemi = Vec::with_capacity(data.len() + 10);
 
         // cEMI Message Code L_Data.req
-        cemi.push(KDRIVE_CEMI_L_DATA_REQ);
+        cemi.push(MessageCode::LDataReq as u8);
 
         // Additional Info Length (0 = no additional info)
         cemi.push(0x00);
 
-        // Control Field 1 (Standard frame, not repeated, broadcast, priority normal, no ack req)
+        // Control Field 1 (Standard frame, not repeated, broadcast, priority low, no ack req, no error)
         cemi.push(0xBC);
+        /*
+        0b1011 1100
+          extended frame : 0
+          standard frame : 1
+           reserved
+            repeat in case of error : 0
+            do not repeat : 1
+             system broadcast : 0
+             broadcast : 1
+               priority
+               0 : system
+               1 : normal
+               2 : urgent
+               3 : low
+                 0 : no ACK requested
+                 1 : ACK requested
+                  0 : no error ( Confirm )
+                  1 : error L_DATA.con
+        */
 
         // Control Field 2 (Hop count 6, Extended frame format)
         cemi.push(0xE0);
+        /*
+        0b1110 0000
+          0 : individual address
+          1 : group address
+           xxx routing, hop count
+               0 = standard frame
+        */
 
         // Source address (0x0000 = device address)
         cemi.push(0x00);
@@ -489,7 +568,9 @@ impl KDriveFT12 {
             cemi.push((apci >> 8) as u8);
             cemi.push((apci & 0xFF) as u8);
         } else {
-            todo!("I think this len should be in bits");
+            todo!("data bytes, w/o TPCI/APCI bits");
+            //https://www.dehof.de/eib/pdfs/EMI-FT12-Message-Format.pdf
+
             // Data length (NPDU + data)
             let data_len = 1 + data.len(); // +1 for TPCI/APCI
             cemi.push(data_len as u8);
@@ -552,19 +633,27 @@ Example FT1.2 Frame with cEMI Telegram:
 */
 
 impl<'a> cEMIMsg<'a> {
-    pub fn new(data: *const u8, len: u32) -> cEMIMsg<'a> {
-        assert!(len >= 10);
-        cEMIMsg {
-            data: unsafe { std::slice::from_raw_parts(data, len as usize) },
-        }
-    }
-
     pub fn from_bytes(data: &'a [u8]) -> cEMIMsg<'a> {
         cEMIMsg { data }
     }
 
-    pub fn get_msg_code(&self) -> u8 {
-        self.data[0]
+    pub fn get_msg_code(&self) -> MessageCode {
+        match self.data[0] {
+            0x11 => MessageCode::LDataReq,
+            0x2E => MessageCode::LDataCon,
+            0x29 => MessageCode::LDataInd,
+            0xFC => MessageCode::MPropReadReq,
+            0xFB => MessageCode::MPropReadCon,
+            0xF6 => MessageCode::MPropWriteReq,
+            0xF5 => MessageCode::MPropWriteCon,
+            0xF7 => MessageCode::MPropInfoInd,
+            0xF8 => MessageCode::MFuncPropCommandReq,
+            0xFA => MessageCode::MFuncPropCommandCon,
+            0xF9 => MessageCode::MFuncPropStateReadReq,
+            0xF1 => MessageCode::MResetReq,
+            0xF0 => MessageCode::MResetInd,
+            _ => MessageCode::DontKnow,
+        }
     }
 
     pub fn is_group_write(&self) -> bool {
@@ -577,6 +666,8 @@ impl<'a> cEMIMsg<'a> {
             .shr(6u32)
             .bitand(0x0F);
 
+        //https://knx.readthedocs.io/en/latest/knx__types_8h_source.html#l00141
+        
         apci == 2 // Group Value Write
     }
 
