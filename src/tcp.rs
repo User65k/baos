@@ -63,9 +63,9 @@ async fn handle_connection(
             for addr in TargetIter::new(target)? {
                 let bus = bus.clone();
                 let state = state.clone();
-                tokio::spawn(
-                    async move { super::move_to_pos(addr, pos & 0x7f, ang, &bus, &state).await },
-                );
+                tokio::task::spawn_local(async move {
+                    super::move_to_pos(addr, pos & 0x7f, ang, &bus, &state).await
+                });
             }
             return Ok(());
         }

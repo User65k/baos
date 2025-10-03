@@ -7,11 +7,14 @@ use std::{
     },
     ops::{BitAnd, Shr},
     os::fd::{AsRawFd, RawFd},
+    time::Duration,
 };
 
 use tokio::{
     io::{unix::AsyncFd, Interest},
-    sync::SemaphorePermit, task::yield_now,
+    sync::SemaphorePermit,
+    task::yield_now,
+    time::timeout,
 };
 
 // FT1.2 Protocol Constants
@@ -31,8 +34,7 @@ const FT12_FRAME_END: u8 = 0x16;
 /// https://knx.readthedocs.io/en/latest/knx__types_8h_source.html#l00038
 #[derive(PartialEq)]
 #[repr(u8)]
-pub enum MessageCode
-{
+pub enum MessageCode {
     // L_Data services
     LDataReq = 0x11,
     LDataCon = 0x2E,
@@ -55,7 +57,7 @@ pub enum MessageCode
     MResetReq = 0xF1,
     MResetInd = 0xF0,
 
-    DontKnow = 0
+    DontKnow = 0,
 }
 
 pub const KDRIVE_MAX_GROUP_VALUE_LEN: usize = 14;
@@ -198,7 +200,7 @@ struct FT12Dev {
     recv_odd: std::cell::UnsafeCell<bool>,
     /// protected by semaphore
     send_odd: std::cell::UnsafeCell<bool>,
-    fast_read: tokio::sync::Mutex<Vec<Ft12Frame>>
+    fast_read: tokio::sync::Mutex<Vec<Ft12Frame>>,
 }
 impl FT12Dev {
     /// open the serial device and set all the magic ioctrl
@@ -243,7 +245,7 @@ impl FT12Dev {
             s: tokio::sync::Semaphore::new(1),
             recv_odd: true.into(),
             send_odd: true.into(),
-            fast_read: tokio::sync::Mutex::new(Vec::with_capacity(2))
+            fast_read: tokio::sync::Mutex::new(Vec::with_capacity(8)),
         })
     }
     pub async fn reset(&mut self) -> IoResult<()> {
@@ -269,59 +271,83 @@ impl FT12Dev {
         let frame = Ft12Frame::new(control, data);
         self.send_and_ack(&frame.to_bytes(), sp).await
     }
-    ///exclusively write and wait for an ack
+    /// exclusively write and wait for an ack, resend if needed
     async fn send_and_ack(&self, data: &[u8], mut sp: SemaphorePermit<'_>) -> IoResult<()> {
-        self.d.write_all(data).await?;
-        loop{
-            let mut ack_buf = [0u8; 1];
-            self.d.read_exact(&mut ack_buf).await?;
-            match ack_buf[0] {
-                FT12_ACKNOWLEDGE => break,
-                FT12_FRAME_START => {
-                    let mut buf = [0u8;32];
-                    buf[0] = FT12_FRAME_START;
-                    let np = sp.split(0).unwrap();
-                    self.fast_read.lock().await.push(self.internal_read(1, &mut buf, np).await?);
+        let mut r = 1;
+        loop {
+            self.d.write_all(data).await?;
+            match timeout(Duration::from_secs(2), self.wait_for_ack(&mut sp)).await {
+                //timeout, resend
+                Err(_e) => {
+                    if r > 3 {
+                        return Err(std::io::ErrorKind::Deadlock.into());
+                    }
+                    //println!("retry{r} {data:x?}");
+                    r += 1;
                     continue;
-                },
-                _ => return Err(IoErr::new(
-                    InvalidData,
-                    format!("Wrong acknowledge 0x{:x}", ack_buf[0]),
-                )),
+                }
+                //io error
+                Ok(Err(e)) => return Err(e),
+                //success
+                Ok(Ok(())) => break,
             }
         }
         drop(sp);
         yield_now().await;
         Ok(())
     }
-    /*pub async fn blocking_read(&self, buf: &mut [u8]) -> IoResult<Ft12Frame> {
-        let sp =self.s.acquire().await.unwrap();
-
-        println!("read lock");
-        let read = self.d.read(buf).await?;
-        self.internal_read(read, buf, sp).await
-    }*/
+    /// wait for an ACK
+    async fn wait_for_ack(&self, sp: &mut SemaphorePermit<'_>) -> IoResult<()> {
+        loop {
+            let mut ack_buf = [0u8; 1];
+            self.d.read_exact(&mut ack_buf).await?;
+            match ack_buf[0] {
+                FT12_ACKNOWLEDGE => break Ok(()),
+                FT12_FRAME_START => {
+                    let mut buf = [0u8; 32];
+                    buf[0] = FT12_FRAME_START;
+                    let np = sp.split(0).unwrap();
+                    self.fast_read
+                        .lock()
+                        .await
+                        .push(self.internal_read(1, &mut buf, np).await?);
+                    /*{
+                        let l = self.fast_read.lock().await;
+                        println!("buffered {}: {:x?}", l.len(), l.last().unwrap());
+                    }*/
+                    //try_read can fetch this
+                    yield_now().await;
+                    continue;
+                }
+                _ => {
+                    return Err(IoErr::new(
+                        InvalidData,
+                        format!("Wrong acknowledge 0x{:x}", ack_buf[0]),
+                    ))
+                }
+            }
+        }
+    }
     /// wait for data to read
     /// only exclusively read (and ack) once the initial read was successful
     pub async fn try_read(&self, buf: &mut [u8]) -> IoResult<Ft12Frame> {
-
-        let mut v = self.fast_read.lock().await;
-        let buffered = if v.is_empty() {
-            None
-        }else{
-            println!("{} behind", v.len());
-            Some(v.remove(0))
+        let buffered = {
+            let mut v = self.fast_read.lock().await;
+            if v.is_empty() {
+                None
+            } else {
+                //println!("{} behind", v.len());
+                Some(v.remove(0))
+            }
         };
-        drop(v);
         let f = if let Some(a) = buffered {
             a
-        }else{
+        } else {
             let (read, sp) = loop {
                 self.d.wait_readable().await?;
                 // there seems to be data - lock the bus and see if its true...
                 let sp = self.s.acquire().await.unwrap();
 
-                //println!("read lock");
                 match self.d.try_read(buf) {
                     //no data -> release and wait again
                     Err(e) if e.kind() == WouldBlock => {
@@ -362,7 +388,7 @@ impl FT12Dev {
         }
         let length = buf[1] as usize + 6; // length + 4 header bytes + checksum + end
         self.d.read_exact(&mut buf[read..length]).await?;
-        let f= Ft12Frame::from_bytes(&buf[..length]).map_err(|e| IoErr::new(InvalidData, e))?;
+        let f = Ft12Frame::from_bytes(&buf[..length]).map_err(|e| IoErr::new(InvalidData, e))?;
         //println!("read {f:?}");
         let expected_ctrl = if unsafe { self.recv_odd.get().read() } {
             unsafe { self.recv_odd.get().write(false) };
@@ -423,10 +449,28 @@ impl KDriveFT12 {
         // Step 2: Property read 1 (line 18)
         // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x40\x10\x01\xa9\x16
         // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x08\x01\x40\x10\x01\x00\x0b\x33\x16
-        let prop1_frame = vec![MessageCode::MPropReadReq as u8, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01];
+        let prop1_frame = vec![
+            MessageCode::MPropReadReq as u8,
+            0x00,
+            0x08,
+            0x01,
+            0x40,
+            0x10,
+            0x01,
+        ];
         self.0.write(prop1_frame).await?;
         self.expect_specific_response(
-            &[MessageCode::MPropReadCon as u8, 0x00, 0x08, 0x01, 0x40, 0x10, 0x01, 0x00, 0x0b],
+            &[
+                MessageCode::MPropReadCon as u8,
+                0x00,
+                0x08,
+                0x01,
+                0x40,
+                0x10,
+                0x01,
+                0x00,
+                0x0b,
+            ],
             "property read 1",
         )
         .await?;
@@ -434,10 +478,27 @@ impl KDriveFT12 {
         // Step 3: Property read 2 (line 23)
         // Request: \x68\x09\x09\x68\x73\xf6\x00\x08\x01\x34\x10\x01\x00\xb7\x16
         // Expected response: \x68\x08\x08\x68\xf3\xf5\x00\x08\x01\x34\x10\x01\x36\x16
-        let prop2_frame = vec![MessageCode::MPropWriteReq as u8, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00];
+        let prop2_frame = vec![
+            MessageCode::MPropWriteReq as u8,
+            0x00,
+            0x08,
+            0x01,
+            0x34,
+            0x10,
+            0x01,
+            0x00,
+        ];
         self.0.write(prop2_frame).await?;
         self.expect_specific_response(
-            &[MessageCode::MPropWriteCon as u8, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01],
+            &[
+                MessageCode::MPropWriteCon as u8,
+                0x00,
+                0x08,
+                0x01,
+                0x34,
+                0x10,
+                0x01,
+            ],
             "property write",
         )
         .await?;
@@ -445,10 +506,27 @@ impl KDriveFT12 {
         // Step 4: Property read 3 (line 28)
         // Request: \x68\x08\x08\x68\x53\xfc\x00\x08\x01\x34\x10\x01\x9d\x16
         // Expected response: \x68\x09\x09\x68\xd3\xfb\x00\x08\x01\x34\x10\x01\x00\x1c\x16
-        let prop3_frame = vec![MessageCode::MPropReadReq as u8, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01];
+        let prop3_frame = vec![
+            MessageCode::MPropReadReq as u8,
+            0x00,
+            0x08,
+            0x01,
+            0x34,
+            0x10,
+            0x01,
+        ];
         self.0.write(prop3_frame).await?;
         self.expect_specific_response(
-            &[MessageCode::MPropReadCon as u8, 0x00, 0x08, 0x01, 0x34, 0x10, 0x01, 0x00],
+            &[
+                MessageCode::MPropReadCon as u8,
+                0x00,
+                0x08,
+                0x01,
+                0x34,
+                0x10,
+                0x01,
+                0x00,
+            ],
             "property read 2",
         )
         .await?;
@@ -456,10 +534,28 @@ impl KDriveFT12 {
         // Step 5: Property read 4 (line 33)
         // Request: \x68\x08\x08\x68\x73\xfc\x00\x08\x01\x33\x10\x01\xbc\x16
         // Expected response: \x68\x0a\x0a\x68\xf3\xfb\x00\x08\x01\x33\x10\x01\x00\x02\x3d\x16
-        let prop4_frame = vec![MessageCode::MPropReadReq as u8, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01];
+        let prop4_frame = vec![
+            MessageCode::MPropReadReq as u8,
+            0x00,
+            0x08,
+            0x01,
+            0x33,
+            0x10,
+            0x01,
+        ];
         self.0.write(prop4_frame).await?;
         self.expect_specific_response(
-            &[MessageCode::MPropReadCon as u8, 0x00, 0x08, 0x01, 0x33, 0x10, 0x01, 0x00, 0x02],
+            &[
+                MessageCode::MPropReadCon as u8,
+                0x00,
+                0x08,
+                0x01,
+                0x33,
+                0x10,
+                0x01,
+                0x00,
+                0x02,
+            ],
             "property read 3",
         )
         .await?;
@@ -467,10 +563,28 @@ impl KDriveFT12 {
         // Step 6: Property read 5 (line 38)
         // Request: \x68\x08\x08\x68\x53\xfc\x00\x00\x01\x38\x10\x01\x99\x16
         // Expected response: \x68\x0a\x0a\x68\xd3\xfb\x00\x00\x01\x38\x10\x01\x00\x37\x4f\x16
-        let prop5_frame = vec![MessageCode::MPropReadReq as u8, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01];
+        let prop5_frame = vec![
+            MessageCode::MPropReadReq as u8,
+            0x00,
+            0x00,
+            0x01,
+            0x38,
+            0x10,
+            0x01,
+        ];
         self.0.write(prop5_frame).await?;
         self.expect_specific_response(
-            &[MessageCode::MPropReadCon as u8, 0x00, 0x00, 0x01, 0x38, 0x10, 0x01, 0x00, 0x37],
+            &[
+                MessageCode::MPropReadCon as u8,
+                0x00,
+                0x00,
+                0x01,
+                0x38,
+                0x10,
+                0x01,
+                0x00,
+                0x37,
+            ],
             "property read 4",
         )
         .await?;
@@ -667,7 +781,7 @@ impl<'a> cEMIMsg<'a> {
             .bitand(0x0F);
 
         //https://knx.readthedocs.io/en/latest/knx__types_8h_source.html#l00141
-        
+
         apci == 2 // Group Value Write
     }
 

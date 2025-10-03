@@ -87,10 +87,14 @@ async fn async_main() {
                 ));
                 set.spawn_local(mqtt::drive(connection, bus_sender.clone(), states.clone()));
             }
+            //wait for the first task to "finish" aka crash
             let res = set.join_next().await.unwrap();
             eprintln!("Task ended: {res:?}");
         })
         .await;
+    // we could figure out who finished early/paniced
+    // spawn it anew and continue
+    // .. or just die and let systemd restart the whole thing
 }
 
 #[cfg(any(feature = "mqtt", feature = "socket"))]

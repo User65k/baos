@@ -12,14 +12,15 @@ pub async fn setup() -> (AsyncClient, EventLoop) {
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
     let (client, connection) = AsyncClient::new(mqttoptions, 32);
-    client.subscribe_many(
-        (b'a'..=b'h').flat_map(|c| {
+    client
+        .subscribe_many((b'a'..=b'h').flat_map(|c| {
             [
-            SubscribeFilter::new(format!("cover/{}/set", c as char), QoS::AtMostOnce),
-            SubscribeFilter::new(format!("cover/{}/tilt", c as char), QoS::AtMostOnce)
+                SubscribeFilter::new(format!("cover/{}/set", c as char), QoS::AtMostOnce),
+                SubscribeFilter::new(format!("cover/{}/tilt", c as char), QoS::AtMostOnce),
             ]
-        })
-    ).await.expect("sub");
+        }))
+        .await
+        .expect("sub");
 
     client
         .publish("cover/availability", QoS::AtLeastOnce, true, "online")
