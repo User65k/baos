@@ -20,7 +20,7 @@ mod mqtt;
 /// time a blind needs to go from top to bottom or visa verce
 const FULL_TRAVEL_TIME: Duration = Duration::from_millis(63_500); //57_600
 /// time a blind needs to turn upside down
-const FULL_TURN_TIME: Duration = Duration::from_millis(2_800);
+const FULL_TURN_TIME: Duration = Duration::from_millis(2_000);
 
 fn main() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -105,20 +105,20 @@ async fn async_main() {
 #[cfg(any(feature = "mqtt", feature = "socket"))]
 async fn move_to_pos(
     id: Blind,
-    target_p: u8,
-    target_a: u8,
+    target_p: Pos,
+    target_a: Angle,
     k: &GroupWriter,
     state: &Arc<Mutex<StateStore>>,
 ) -> Option<()> {
     //short circuit
     match (target_p, target_a) {
-        (0, 0) => {
+        (Pos::BOTTOM, Angle::BOTTOM) => {
             k.send((id.to_bus_addr(false), Direction::Down))
                 .await
                 .ok()?;
             return Some(());
         }
-        (100, 7) => {
+        (Pos::TOP, Angle::TOP) => {
             k.send((id.to_bus_addr(false), Direction::Up)).await.ok()?;
             return Some(());
         }
@@ -126,57 +126,42 @@ async fn move_to_pos(
     }
 
     //get curr pos
-    let a = state.lock().await.get(&id).map(|(_, _, p, a)| (*p, *a));
-    //match on a in oder to avoid blocking the mutex in None case
-    let (mut p, mut a) = match a {
+    let current = state.lock().await.get(&id).map(|(_, _, p, a)| (*p, *a));
+    //match on `current` in oder to avoid blocking the mutex in None case
+    let (mut current_position, mut current_angle) = match current {
         Some(a) => a,
         None => {
             //we don't know where it is, so drive it into the closest side
-            let dir = if target_p < 50 {
-                Direction::Down
-            } else {
-                Direction::Up
-            };
+            let (dir, _) = Pos::from_num(50).delta(target_p);
             k.send((id.to_bus_addr(false), dir)).await.ok()?;
             sleep(FULL_TRAVEL_TIME).await;
-            if target_p < 50 {
-                (Pos::bottom(), Angle::bottom())
-            } else {
-                (Pos::top(), Angle::top())
+            match dir {
+                Direction::Up => (Pos::TOP, Angle::TOP),
+                Direction::Down => (Pos::BOTTOM, Angle::BOTTOM),
             }
         }
     };
-    let cur: u8 = p.into();
-    //move for x ms (x=FULL_MOVE/100*(cur-target_p)))
-    let (dir, div) = if cur > target_p {
-        //go down
-        (Direction::Down, cur - target_p)
-    } else {
-        //go up
-        (Direction::Up, target_p - cur)
-    };
+    //println!("Abs move from {:?} / {:?} to {} / {}", current_position, current_angle, target_p, target_a);
+
+    let (dir, div) = current_position.delta(target_p);
     if div > 0 {
-        //let ttm = FULL_TRAVEL_TIME.mul_f32((div as f32)/100f32);
-        let ttm = FULL_TRAVEL_TIME * (div as u32) / 100u32;
+        let ttm = Pos::step_time(div);
         k.send((id.to_bus_addr(false), dir)).await.ok()?;
         sleep(ttm).await;
-        tracking::shortened_move(id, ttm, dir, &mut p, &mut a);
+        //keep a local track of current_angle - the state store is updated directly form the bus messages
+        tracking::shortened_move(id, ttm, dir, &mut current_position, &mut current_angle);
     }
-    let cur: u8 = a.into();
-    let (dir, div) = if cur > target_a {
-        //go down
-        (Direction::Down, cur - target_a)
-    } else {
-        if cur == target_a {
-            // just stop to move
+    if current_angle == target_a {
+        if div > 0 {
+            // just stop the move to pos
             k.send((id.to_bus_addr(true), dir)).await.ok()?;
-            return Some(());
         }
-        //go up
-        (Direction::Up, target_a - cur)
-    };
+        return Some(());
+    }
+    let (dir, div) = current_angle.delta(target_a);
+    
     k.send((id.to_bus_addr(false), dir)).await.ok()?;
-    let ttm = FULL_TURN_TIME * (div as u32) / 8u32;
+    let ttm = Angle::step_time(div);
     sleep(ttm).await;
     k.send((id.to_bus_addr(true), dir)).await.ok()?;
     Some(())

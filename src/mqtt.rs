@@ -1,4 +1,4 @@
-use crate::types::{Blind, Direction, GroupWriter, StateStore};
+use crate::types::{Angle, Blind, Direction, GroupWriter, Pos, StateStore};
 use rumqttc::v5::{
     mqttbytes::{
         v5::{Filter, LastWill, Packet},
@@ -94,7 +94,6 @@ pub async fn report(id: Blind, state: &Mutex<StateStore>, client: &AsyncClient) 
     //query data
     let s = state.lock().await;
     if let Some((t, up, position, tilt)) = s.get(&id) {
-        let pos = (*position).into();
         let state = if t.is_some() {
             //its currently moving
             match up {
@@ -102,13 +101,15 @@ pub async fn report(id: Blind, state: &Mutex<StateStore>, client: &AsyncClient) 
                 Direction::Down => "closing",
             }
         } else {
-            match pos {
-                100u8 => "open",
-                0u8 => "closed",
+            match *position {
+                Pos::TOP => "open",
+                Pos::BOTTOM => "closed",
                 _ => "stopped",
             }
         };
+        let pos: u8 = (*position).into();
         let tilt: u8 = (*tilt).into();
+        drop(s);
         client
             .publish(
                 format!("cover/{}/position", id.letter()),
@@ -137,6 +138,7 @@ pub async fn report(id: Blind, state: &Mutex<StateStore>, client: &AsyncClient) 
             .await
             .unwrap();
     } else {
+        drop(s);
         client
             .publish(
                 format!("cover/{}/state", id.letter()),
@@ -183,14 +185,14 @@ async fn mqtt_tilt(b: Blind, cmd: &[u8], sender: &GroupWriter, state: &Arc<Mutex
         return;
     }
     let a = cmd[0] - b'0';
-    if a > 7 {
+    if a > Angle::TOP.into() {
         return;
     }
     let Some(p) = state.lock().await.get(&b).map(|(_, _, p, _)| *p) else {
         return;
     };
 
-    super::move_to_pos(b, p.into(), a, sender, state)
+    super::move_to_pos(b, p, Angle::from_num(a), sender, state)
         .await
         .expect("cant send")
 }

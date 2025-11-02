@@ -1,4 +1,4 @@
-use crate::types::{Blind, Direction, GroupWriter, StateStore};
+use crate::types::{Angle, Blind, Direction, GroupWriter, Pos, StateStore};
 use std::{ops::RangeInclusive, sync::Arc};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -63,7 +63,7 @@ async fn handle_connection(
                 let bus = bus.clone();
                 let state = state.clone();
                 tokio::task::spawn_local(async move {
-                    super::move_to_pos(addr, pos & 0x7f, ang, &bus, &state)
+                    super::move_to_pos(addr, Pos::from_num(pos & 0x7f), Angle::from_num(ang), &bus, &state)
                         .await
                         .expect("cant send")
                 });

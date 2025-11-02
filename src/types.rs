@@ -63,7 +63,7 @@ impl Debug for Blind {
         f.write_fmt(format_args!("{:x}", self.0))
     }
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Angle(u8);
 impl Angle {
     const MAX: u8 = 7;
@@ -110,11 +110,27 @@ impl Angle {
             true
         }
     }
-    pub fn top() -> Angle {
-        Angle(Self::MAX)
+    pub const TOP: Angle = Angle(Self::MAX);
+    pub const BOTTOM: Angle = Angle(0);
+    /// move for x ms (x=FULL_TURN/Angle::TOP*steps)
+    pub fn step_time(steps: u8) -> Duration {
+        crate::FULL_TURN_TIME * (steps as u32) / (Self::MAX as u32)
     }
-    pub fn bottom() -> Angle {
-        Angle(0)
+    /// return the direction and steps between `other` and self.
+    /// `other` is the new position, so
+    /// Down, if other is smaller
+    pub fn delta(&self, other: Angle) -> (Direction, u8) {
+        if self.0 > other.0 {
+            //go down
+            (Direction::Down, self.0 - other.0)
+        } else {
+            //go up
+            (Direction::Up, other.0 - self.0)
+        }
+    }
+    pub fn from_num(n: u8) -> Angle {
+        assert!(n <= Self::MAX);
+        Angle(n)
     }
 }
 impl From<Angle> for u8 {
@@ -122,15 +138,16 @@ impl From<Angle> for u8 {
         val.0
     }
 }
-#[derive(Debug, Clone, Copy)]
+/*impl std::ops::SubAssign<Duration> for Angle {
+    fn sub_assign(&mut self, rhs: Duration) {
+        self.down(rhs);
+    }
+}*/
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pos(u8);
 impl Pos {
-    pub fn top() -> Pos {
-        Pos(100)
-    }
-    pub fn bottom() -> Pos {
-        Pos(0)
-    }
+    pub const TOP: Pos = Pos(100);
+    pub const BOTTOM: Pos = Pos(0);
     pub fn up(&mut self, time_moving: Duration) {
         if time_moving >= crate::FULL_TRAVEL_TIME {
             self.0 = 100;
@@ -152,6 +169,26 @@ impl Pos {
         }
         let div = 100 * time_moving.as_nanos() / crate::FULL_TRAVEL_TIME.as_nanos();
         self.0 = self.0.saturating_sub(div as u8);
+    }
+    /// move for x ms (x=FULL_MOVE/Pos::TOP*steps)
+    pub fn step_time(steps: u8) -> Duration {
+        crate::FULL_TRAVEL_TIME * (steps as u32) / 100u32
+    }
+    /// return the direction and steps between `other` and self.
+    /// `other` is the new position, so
+    /// Down, if other is smaller
+    pub fn delta(&self, other: Pos) -> (Direction, u8) {
+        if self.0 > other.0 {
+            //go down
+            (Direction::Down, self.0 - other.0)
+        } else {
+            //go up
+            (Direction::Up, other.0 - self.0)
+        }
+    }
+    pub fn from_num(n: u8) -> Pos {
+        assert!(n <= 100);
+        Pos(n)
     }
 }
 impl From<Pos> for u8 {

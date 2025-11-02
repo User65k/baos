@@ -46,31 +46,22 @@ pub async fn on_telegram(data: cEMIMsg<'_>, user_data: &Sender<ChannelMsg>) {
                                     u16::from_be_bytes(msg[..2].try_into().unwrap())
                                 );
                             }
-                            addr if addr & 0xFE00 == 0x1000 => {
-                                if msg.len() == 1 {
-                                    //keep track of own IDs
-                                    track_write(addr, msg[0], user_data).await;
-                                    //[29, 0, bc, e0, 12, 12, 11, 32, 1, 0, 80]
-                                    // KDRIVE_CEMI_L_DATA_IND
-                                    //        xx  xx - ctrl
-                                    //                xx  xx - src
-                                    //                        xx  xx - dst
-                                    //                                len
-                                    //
-                                    return;
-                                }
+                            addr if is_cover_addr(addr) && msg.len() == 1 => {
+                                //keep track of own IDs
+                                //println!("Incomming Bus: 0x{:x} {}", addr, msg[0]);
+                                track_write(addr, msg[0], user_data).await;
+                                return;
                             }
                             _ => {}
                         }
                         println!("Group Write: 0x{:x} {:?}", addr, msg);
                         return;
                     }
-                    MessageCode::LDataCon => {
+                    MessageCode::LDataCon if is_cover_addr(addr) && msg.len() == 1 => {
                         // initiated by our group_write
-                        if addr & 0xFE00 == 0x1000 && msg.len() == 1 {
-                            track_write(addr, msg[0], user_data).await;
-                            return;
-                        }
+                        //println!("Outgoing Bus: 0x{:x} {}", addr, msg[0]);
+                        track_write(addr, msg[0], user_data).await;
+                        return;
                     }
                     _ => {}
                 }
@@ -79,19 +70,23 @@ pub async fn on_telegram(data: cEMIMsg<'_>, user_data: &Sender<ChannelMsg>) {
     }
     println!("Bus Data: {:?}", data.as_ref());
 }
+/// addr is a jal-0810.02 cover address (`0x10xx` or `0x11xx`)
+#[inline]
+fn is_cover_addr(addr: u16) -> bool {
+    addr & 0xFE00 == 0x1000
+}
 /// further process an incoming message
 /// sends it over a channel to `track_movements`
 async fn track_write(addr: u16, val: u8, sender: &Sender<ChannelMsg>) {
-    let (_lower, upper) = match Blind::from_bus_addr(addr) {
-        Ok((r, single_step)) => {
-            println!("Bus: 0x{:x} {}", addr, val);
-            let val = if val == Direction::Up as u8 {
+    let (_lower, _upper) = match Blind::from_bus_addr(addr) {
+        Ok((blind_id, single_step)) => {
+            let direction = if val == Direction::Up as u8 {
                 Direction::Up
             } else {
                 Direction::Down
             };
             if sender
-                .send((Instant::now(), val, single_step, r))
+                .send((Instant::now(), direction, single_step, blind_id))
                 .await
                 .is_err()
             {
@@ -101,13 +96,15 @@ async fn track_write(addr: u16, val: u8, sender: &Sender<ChannelMsg>) {
         }
         Err((a, b)) => (a, b),
     };
+    /*
+    //lower might be a cover from another apartment
     if upper == Blind::CMD_SINGLE_STEP {
         //println!("Step: 0x{:x} {:?}", lower, val);
     } else if upper == Blind::CMD_FULL_MOVE {
         //println!("Voll: 0x{:x} {:?}", lower, val);
     } else {
-        println!("Group Write: 0x{:x} {:?}", addr, val);
-    }
+        unreachable!("track_write is only ever called after is_cover_addr")
+    }*/
 }
 /// called from a channel in `track_write`
 pub async fn track_movements(
@@ -124,11 +121,6 @@ pub async fn track_movements(
                 drop(ss);
                 #[cfg(feature = "mqtt")]
                 crate::mqtt::report(id, &states, &client).await;
-                /*println!("states:");
-                let s = states.lock().expect("poised");
-                for (&k, (_i, _u, p, a)) in s.iter() {
-                    println!("{:x}: {:?} {:?}", k, p, a);
-                }*/
             }
             Err(_timeout) => {
                 //clean up status -> look for full moves
@@ -170,7 +162,7 @@ fn track_single_press(
         //wind - all up
         for k in b'a'..=b'h' {
             let id = Blind::from_port(k);
-            states.insert(id, (Some(time), goes_up, Pos::top(), Angle::top()));
+            states.insert(id, (Some(time), goes_up, Pos::TOP, Angle::TOP));
         }
         return;
     }
@@ -209,8 +201,8 @@ fn track_single_press(
         *moves_up = goes_up;
     } else {
         //remember this move
-        let mut ang = Angle::bottom();
-        let mut pos = Pos::bottom();
+        let mut ang = Angle::BOTTOM;
+        let mut pos = Pos::BOTTOM;
         //start at the opposite full range
         let moveit = match goes_up {
             Direction::Up => Direction::Down,
@@ -254,12 +246,12 @@ fn full_move(id: Blind, moves_up: Direction, pos: &mut Pos, ang: &mut Angle) {
     //complete run
     match moves_up {
         Direction::Up => {
-            *pos = Pos::top();
-            *ang = Angle::top();
+            *pos = Pos::TOP;
+            *ang = Angle::TOP;
         }
         Direction::Down => {
-            *pos = Pos::bottom();
-            *ang = Angle::bottom();
+            *pos = Pos::BOTTOM;
+            *ang = Angle::BOTTOM;
         }
     }
     println!("{:?} moved {:?} completely", id, moves_up);
