@@ -1,10 +1,8 @@
 use crate::types::{Angle, Blind, Direction, GroupWriter, Pos, StateStore};
 use rumqttc::v5::{
-    mqttbytes::{
-        v5::{Filter, LastWill, Packet},
-        QoS,
-    },
-    AsyncClient, Event, EventLoop, MqttOptions,
+    AsyncClient, ConnectionError, Event, EventLoop, MqttOptions, StateError, mqttbytes::{
+        QoS, v5::{Filter, LastWill, Packet}
+    }
 };
 use std::{env, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -33,6 +31,7 @@ pub async fn drive(
     state: Arc<Mutex<StateStore>>,
     client: AsyncClient,
 ) {
+    let mut error_count = 0;
     loop {
         match connection.poll().await {
             Ok(notification) => {
@@ -56,6 +55,7 @@ pub async fn drive(
                     }
                     Event::Incoming(Packet::ConnAck(_)) => {
                         println!("MQTT connected");
+                        error_count = 0;
                         client
                             .subscribe_many((b'a'..=b'h').flat_map(|c| {
                                 [
@@ -81,9 +81,27 @@ pub async fn drive(
             }
             Err(e) => {
                 //already done on poll: connection.clean();
-
                 //MQTT Error: Mqtt state: Connection closed by peer abruptly
                 eprintln!("MQTT Error: {}", e);
+                if match e {
+                    ConnectionError::MqttState(StateError::ConnectionAborted) => true,
+                    ConnectionError::Io(io) | ConnectionError::MqttState(StateError::Io(io)) => {
+                        matches!(io.kind(), std::io::ErrorKind::ConnectionRefused |
+                            std::io::ErrorKind::HostUnreachable |
+                            std::io::ErrorKind::NetworkUnreachable |
+                            std::io::ErrorKind::AddrNotAvailable |
+                            std::io::ErrorKind::ConnectionAborted | 
+                            std::io::ErrorKind::NetworkDown)
+                    },
+                    ConnectionError::ConnectionRefused(_) => true,
+                    _ => false,
+                } {
+                    tokio::time::sleep(Duration::from_secs(1<<error_count)).await;
+                }
+                error_count += 1;
+                if error_count == 10 {
+                    panic!("MQTT max errors");
+                }
             }
         }
     }
