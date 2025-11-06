@@ -600,9 +600,9 @@ impl KDriveFT12 {
         expected_data: &[u8],
         step_name: &str,
     ) -> IoResult<()> {
-        let mut temp_buf = [0u8; 512];
-
-        let frame = self.0.try_read(&mut temp_buf).await?;
+        let mut temp_buf = [0u8; 32];
+        let temp_buf = &mut temp_buf[..expected_data.len()+7];
+        let frame = self.0.try_read(temp_buf).await?;
         // Validate response data matches expected
         if frame.data == expected_data {
             Ok(())
